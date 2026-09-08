@@ -1,0 +1,3 @@
+# Patch context and verbatim upstream license texts must not be reformatted.
+*.patch -whitespace
+LICENSES/* -whitespace

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# LZAMP additions to Rockchip's rockchip_linux_defconfig.
+
+# Keep the kernel release and module directory independent of Git dirtiness.
+CONFIG_LOCALVERSION="-lzamp"
+# CONFIG_LOCALVERSION_AUTO is not set
+
+# The target uses MT7922 rather than Rockchip's out-of-tree Broadcom stack.
+# CONFIG_BCMDHD is not set
+
+# MediaTek MT7922 uses the mt7921e PCIe driver.  Keep it modular so firmware
+# can be loaded from the root filesystem after PCIe enumeration.
+CONFIG_MT7921E=m
+
+# The MT7922 Bluetooth function is exposed over USB.  Keep the generic HCI
+# USB driver modular and enable its MediaTek firmware/setup support.
+CONFIG_BT_HCIBTUSB=m
+CONFIG_BT_HCIBTUSB_MTK=y
+
+# Run Zephyr on the Linux-excluded A55 core3 and expose MailMsg priorities.
+CONFIG_MAILBOX=y
+CONFIG_ROCKCHIP_MBOX=y
+CONFIG_LZAMP_AMP_MAILMSG=y

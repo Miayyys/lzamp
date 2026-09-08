@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# Host Python dependencies used by U-Boot's binman/pylibfdt tools.
+pyelftools
+setuptools

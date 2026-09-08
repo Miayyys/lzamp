@@ -1,0 +1,10 @@
+diff --git a/configs/lzamp-rk3588s_defconfig b/configs/lzamp-rk3588s_defconfig
+--- a/configs/lzamp-rk3588s_defconfig
++++ b/configs/lzamp-rk3588s_defconfig
+@@ -18,5 +18,6 @@ CONFIG_SPL_LOAD_FIT=y
+ CONFIG_LEGACY_IMAGE_FORMAT=y
+ CONFIG_DEFAULT_FDT_FILE="rockchip/rk3588s-lzamp.dtb"
++CONFIG_BOOTCOMMAND="bootflow scan -Glb"
+ # CONFIG_DISPLAY_CPUINFO is not set
+ CONFIG_DISPLAY_BOARDINFO_LATE=y
+ CONFIG_SPL_MAX_SIZE=0x40000

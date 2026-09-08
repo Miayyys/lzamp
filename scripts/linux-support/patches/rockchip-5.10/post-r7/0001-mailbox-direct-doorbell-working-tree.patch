@@ -1,0 +1,152 @@
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index 2c2ee5c8d..5f6b31674 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -878,6 +878,34 @@ static ssize_t affinity_state_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(affinity_state);
+ 
++/* Caller holds data->lock.  All A2B writers in this driver use this helper,
++ * so a legacy diagnostic request cannot race a MailMsg doorbell. */
++static int r1_amp_mbox_direct_send_locked(struct r1_amp_cpu_on_data *data,
++					  struct r1_amp_mbox_channel *channel,
++					  u32 command, u32 value)
++{
++	u32 status;
++
++	status = readl_relaxed(data->mbox_regs[channel->controller] +
++			       R1_AMP_MBOX_A2B_STATUS);
++	if (status & BIT(channel->controller_channel)) {
++		channel->tx_ret = -EBUSY;
++		return -EBUSY;
++	}
++
++	channel->tx_msg.cmd = command;
++	channel->tx_msg.data = value;
++	/* Publish shared-memory data before the final DAT doorbell write. */
++	wmb();
++	writel_relaxed(command, data->mbox_regs[channel->controller] +
++		       R1_AMP_MBOX_A2B_CMD(channel->controller_channel));
++	writel_relaxed(value, data->mbox_regs[channel->controller] +
++		       R1_AMP_MBOX_A2B_DAT(channel->controller_channel));
++	channel->tx_ret = 0;
++	channel->tx_count++;
++	return 0;
++}
++
+ static ssize_t ping_store(struct device *dev, struct device_attribute *attr,
+ 			  const char *buf, size_t count)
+ {
+@@ -894,6 +922,12 @@ static ssize_t ping_store(struct device *dev, struct device_attribute *attr,
+ 		return ret;
+ 
+ 	mutex_lock(&data->lock);
++	/* This legacy one-shot command does not wake the MailMsg worker.  Once
++	 * the lifecycle exists it must not share ch3 with protocol doorbells. */
++	if (data->mailmsg_state != R1_AMP_MAILMSG_UNARMED) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
+ 	ret = r1_amp_mailmsg_data_gate_locked(data);
+ 	if (ret)
+ 		goto out;
+@@ -921,22 +955,17 @@ static ssize_t ping_store(struct device *dev, struct device_attribute *attr,
+ 	__flush_dcache_area(observation, sizeof(*observation));
+ 	dsb(sy);
+ 
+-	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_msg.cmd = R1_AMP_CMD_PING;
+-	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_msg.data = value;
+-	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_ret =
+-		mbox_send_message(data->mbox[R1_AMP_MBOX_TX_CHANNEL].chan,
+-				  &data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_msg);
+-	if (data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_ret < 0) {
+-		ret = data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_ret;
++	ret = r1_amp_mbox_direct_send_locked(
++		data, &data->mbox[R1_AMP_MBOX_TX_CHANNEL], R1_AMP_CMD_PING,
++		value);
++	if (ret < 0)
+ 		goto out;
+-	}
+ 	data->mbox_a2b_at_tx_status =
+ 		readl_relaxed(data->mbox_regs[0] + R1_AMP_MBOX_A2B_STATUS);
+ 	data->mbox_a2b_at_tx_cmd = readl_relaxed(data->mbox_regs[0] +
+ 				       R1_AMP_MBOX_A2B_CMD(R1_AMP_MBOX_TX_CHANNEL));
+ 	data->mbox_a2b_at_tx_data = readl_relaxed(data->mbox_regs[0] +
+ 				        R1_AMP_MBOX_A2B_DAT(R1_AMP_MBOX_TX_CHANNEL));
+-	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_count++;
+ 	ret = count;
+ out:
+ 	mutex_unlock(&data->lock);
+@@ -968,14 +997,10 @@ static ssize_t doorbell_store(struct device *dev, struct device_attribute *attr,
+ 		goto out;
+ 
+ 	channel = &data->mbox[index];
+-	channel->tx_msg.cmd = 0xa2b00000U | index;
+-	channel->tx_msg.data = value;
+-	channel->tx_ret = mbox_send_message(channel->chan, &channel->tx_msg);
+-	if (channel->tx_ret < 0) {
+-		ret = channel->tx_ret;
++	ret = r1_amp_mbox_direct_send_locked(data, channel,
++					     0xa2b00000U | index, value);
++	if (ret < 0)
+ 		goto out;
+-	}
+-	channel->tx_count++;
+ 	ret = count;
+ out:
+ 	mutex_unlock(&data->lock);
+@@ -1280,15 +1305,14 @@ static int mailmsg_test_enqueue_locked(struct r1_amp_cpu_on_data *data,
+ 				       corrupt_payload);
+ }
+ 
+-/* Caller holds data->lock.  mbox_send_message() queues first in the generic
+- * Linux mailbox core, so its non-negative cookie does not say that hardware
+- * accepted a fresh doorbell.  Inspect A2B_STATUS before submitting: when the
+- * selected bit is already pending, do not create a redundant core-TX queue
+- * entry.  The earlier doorbell will make CPU3 poll this priority ring. */
++/* Caller holds data->lock.  MailMsg payload lives in shared memory; the
++ * mailbox carries only a level-like wakeup hint.  Keep at most one hardware
++ * doorbell pending per priority.  Do not route this high-rate hint through
++ * the generic mailbox TX queue: its polled TX completion can lag behind the
++ * remote A2B clear and accumulate redundant software entries. */
+ static int mailmsg_notify_locked(struct r1_amp_cpu_on_data *data, u32 priority)
+ {
+ 	struct r1_amp_mbox_channel *channel = &data->mbox[priority];
+-	u32 status;
+ 	int result;
+ 
+ 	if (!data->lifecycle_notify_bypass && data->notify_inject_remaining &&
+@@ -1302,25 +1326,17 @@ static int mailmsg_notify_locked(struct r1_amp_cpu_on_data *data, u32 priority)
+ 		return result;
+ 	}
+ 
+-	channel->tx_msg.cmd = R1_AMP_MAILMSG_DOORBELL | priority;
+-	channel->tx_msg.data = priority;
+-	status = readl_relaxed(data->mbox_regs[channel->controller] +
+-			       R1_AMP_MBOX_A2B_STATUS);
+-	if (status & BIT(channel->controller_channel)) {
+-		/* Expose the observed hardware-busy reason without submitting. */
+-		channel->tx_ret = -EBUSY;
++	result = r1_amp_mbox_direct_send_locked(
++		data, channel, R1_AMP_MAILMSG_DOORBELL | priority, priority);
++	if (result == -EBUSY) {
++		/* The pending doorbell will make CPU3 drain this priority ring. */
+ 		result = MAILMSG_NOTIFY_COALESCED;
+ 		channel->notify_coalesced_count++;
++	} else if (result < 0) {
++		channel->notify_failed_count++;
+ 	} else {
+-		channel->tx_ret = mbox_send_message(channel->chan, &channel->tx_msg);
+-		if (channel->tx_ret < 0) {
+-			result = channel->tx_ret;
+-			channel->notify_failed_count++;
+-		} else {
+-			result = MAILMSG_NOTIFY_SENT;
+-			channel->tx_count++;
+-			channel->notify_sent_count++;
+-		}
++		result = MAILMSG_NOTIFY_SENT;
++		channel->notify_sent_count++;
+ 	}
+ 
+ 	channel->notify_result = result;

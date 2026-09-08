@@ -1,0 +1,39 @@
+LZAMP license scope
+===================
+The root MIT license applies to LZAMP-authored files unless an individual
+file carries a different notice. It does not relicense third-party code,
+kernel sources, patches to upstream projects, runtime libraries or models.
+Existing copyright and SPDX notices take precedence and must be retained.
+
+Linux integration
+-----------------
+Source: https://github.com/rockchip-linux/kernel.git
+Base: 470f9dccbdc42e7b8a824d0a5c5640a10e9457d2
+The complete kernel retains COPYING and LICENSES. The LZAMP Linux launcher
+is marked GPL-2.0-only. MailMsg sources retain their MIT identifiers.
+Linux/DTS patches retain the licenses and notices of their upstream targets.
+
+Zephyr integration
+------------------
+Source: https://github.com/zephyrproject-rtos/zephyr.git
+Base: 684c9e8f32e4373a21098559f748f06915f950c9
+Upstream modifications retain upstream license terms and notices.
+zephyr/cache-sync.S retains its existing Apache-2.0 identifier; it was
+extracted from the local early-checkpoint implementation, and is not
+relicensed by this root MIT license.
+
+RKLLM service
+-------------
+Source: https://github.com/airockchip/rknn-llm.git
+Base: 878f9361fd3afa7e167b7079918918f78d2c1c2a
+Target: examples/rkllm_server_demo/rkllm_server/flask_server.py
+agent/rkllm-server-r7.patch modifies this upstream file, not an independently
+licensed replacement. scripts/prepare-rkllm-server.sh preserves the upstream
+LICENSE as LICENSE.upstream next to the prepared service and runtime library.
+The binary runtime and model are not distributed in this main repository.
+
+Other upstream dependencies
+---------------------------
+Optional U-Boot/rkbin sources and historical patches retain their original
+terms. Pinned source references are in manifests/sources.lock.yaml and the
+preparation scripts. Downloading a dependency does not put it under MIT.

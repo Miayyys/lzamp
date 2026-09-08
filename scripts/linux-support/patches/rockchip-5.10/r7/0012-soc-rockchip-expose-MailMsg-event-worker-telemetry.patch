@@ -1,0 +1,161 @@
+From 3944bf4a74bf934156ce339950d5def9f808e1d1 Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Tue, 1 Sep 2026 11:22:17 +0800
+Subject: [PATCH 12/12] soc: rockchip: expose MailMsg event worker telemetry
+
+---
+ .../boot/dts/rockchip/rk3588s-yyt-amp.dts     |  4 +-
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 64 ++++++++++++++++++-
+ 2 files changed, 63 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
+index efbe5f95b..3f7cf2784 100644
+--- a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
+@@ -86,8 +86,8 @@ r1_amp_cpu_on_heartbeat: amp-cpu-on-heartbeat {
+ 			 <&mailbox0 2>, <&mailbox0 3>;
+ 		target-mpidr = /bits/ 64 <0x300>;
+ 		zephyr-entry = /bits/ 64 <0x5000100c>;
+-		/* MailMsg V2 Zephyr image: 41,008 B; keep the sysfs loader exact. */
+-		zephyr-image-size = <0xa030>;
++		/* Fixed 48 KiB MailMsg image slot; smaller binaries are zero-padded. */
++		zephyr-image-size = <0xc000>;
+ 		status-offset = <0xff000>;
+ 		status = "okay";
+ 	};
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index eedf6e066..2c2ee5c8d 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -50,7 +50,8 @@
+ #define R1_AMP_RSP_COMMIT_OFF	0x100
+ #define R1_AMP_MBOX_OBS_OFF	0x140
+ #define R1_AMP_MAILMSG_TX_FULL_OBS_OFF	0x180
+-#define R1_AMP_PROTOCOL_SIZE	0x1c0
++#define R1_AMP_MAILMSG_WORKER_OBS_OFF	0x1c0
++#define R1_AMP_PROTOCOL_SIZE	0x200
+ #define R1_AMP_MAILMSG_OFF	0x200
+ #define R1_AMP_STATE_SIZE	(R1_AMP_MAILMSG_OFF + sizeof(struct mailmsg_shared))
+ #define R1_AMP_CMD_PING		1
+@@ -138,10 +139,28 @@ struct r1_amp_mbox_observation_line {
+ 	u8 reserved[R1_AMP_CACHE_LINE_SIZE - 16];
+ };
+ 
++#define R1_AMP_MAILMSG_WORKER_OBSERVATION_MAGIC	0x4d455654U /* "MEVT" */
++struct r1_amp_mailmsg_worker_observation_line {
++	u32 magic;
++	u32 commit;
++	u32 commit_inv;
++	u32 irq_count;
++	u32 wake_count;
++	u32 drain_count;
++	u32 message_count;
++	u32 empty_wake_count;
++	u32 last_pending;
++	u32 pending_now;
++	u32 last_priority;
++	u8 reserved[R1_AMP_CACHE_LINE_SIZE - 44];
++};
++
+ static_assert(sizeof(struct r1_amp_payload_line) == R1_AMP_CACHE_LINE_SIZE);
+ static_assert(sizeof(struct r1_amp_commit_line) == R1_AMP_CACHE_LINE_SIZE);
+ static_assert(sizeof(struct r1_amp_mbox_observation_line) ==
+ 	      R1_AMP_CACHE_LINE_SIZE);
++static_assert(sizeof(struct r1_amp_mailmsg_worker_observation_line) ==
++	      R1_AMP_CACHE_LINE_SIZE);
+ static_assert(sizeof(struct mailmsg_tx_full_observation) ==
+ 	      R1_AMP_CACHE_LINE_SIZE);
+ 
+@@ -530,6 +549,12 @@ r1_amp_mailmsg_tx_full_observation_ptr(struct r1_amp_cpu_on_data *data)
+ 	return r1_amp_protocol_ptr(data, R1_AMP_MAILMSG_TX_FULL_OBS_OFF);
+ }
+ 
++static struct r1_amp_mailmsg_worker_observation_line *
++r1_amp_mailmsg_worker_observation_ptr(struct r1_amp_cpu_on_data *data)
++{
++	return r1_amp_protocol_ptr(data, R1_AMP_MAILMSG_WORKER_OBS_OFF);
++}
++
+ static struct mailmsg_shared *mailmsg_linux_shared_ptr(struct r1_amp_cpu_on_data *data)
+ {
+ 	return r1_amp_protocol_ptr(data, R1_AMP_MAILMSG_OFF);
+@@ -677,12 +702,18 @@ static ssize_t status_show(struct device *dev,
+ 	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
+ 	struct r1_amp_mbox_observation_line *observation;
+ 	struct mailmsg_tx_full_observation *tx_full_observation;
++	struct r1_amp_mailmsg_worker_observation_line *worker_observation;
+ 	u64 magic, current_el;
+ 	u32 observation_magic, observation_status, observation_cmd, observation_data;
+ 	u32 tx_full_commit_first, tx_full_commit_second, tx_full_commit_inv;
+ 	u32 tx_full_magic, tx_full_count, tx_full_priority, tx_full_type;
+ 	mailmsg_s32 tx_full_result;
+ 	bool tx_full_valid;
++	u32 worker_commit_first, worker_commit_second, worker_commit_inv;
++	u32 worker_magic, worker_irq_count, worker_wake_count, worker_drain_count;
++	u32 worker_message_count, worker_empty_wake_count, worker_last_pending;
++	u32 worker_pending_now, worker_last_priority;
++	bool worker_valid;
+ 	u32 a2b_now_status[R1_AMP_MBOX_CONTROLLERS];
+ 	struct r1_amp_mbox_channel *ch;
+ 	int controller, channel;
+@@ -715,6 +746,28 @@ static ssize_t status_show(struct device *dev,
+ 		tx_full_commit_first &&
+ 		tx_full_commit_first == tx_full_commit_second &&
+ 		tx_full_commit_inv == ~tx_full_commit_second;
++	worker_observation = r1_amp_mailmsg_worker_observation_ptr(data);
++	__inval_dcache_area(worker_observation, sizeof(*worker_observation));
++	dsb(sy);
++	worker_commit_first = READ_ONCE(worker_observation->commit);
++	worker_magic = READ_ONCE(worker_observation->magic);
++	worker_irq_count = READ_ONCE(worker_observation->irq_count);
++	worker_wake_count = READ_ONCE(worker_observation->wake_count);
++	worker_drain_count = READ_ONCE(worker_observation->drain_count);
++	worker_message_count = READ_ONCE(worker_observation->message_count);
++	worker_empty_wake_count = READ_ONCE(worker_observation->empty_wake_count);
++	worker_last_pending = READ_ONCE(worker_observation->last_pending);
++	worker_pending_now = READ_ONCE(worker_observation->pending_now);
++	worker_last_priority = READ_ONCE(worker_observation->last_priority);
++	__inval_dcache_area(worker_observation, sizeof(*worker_observation));
++	dsb(sy);
++	worker_commit_second = READ_ONCE(worker_observation->commit);
++	worker_commit_inv = READ_ONCE(worker_observation->commit_inv);
++	worker_valid =
++		worker_magic == R1_AMP_MAILMSG_WORKER_OBSERVATION_MAGIC &&
++		worker_commit_first &&
++		worker_commit_first == worker_commit_second &&
++		worker_commit_inv == ~worker_commit_second;
+ 	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++)
+ 		a2b_now_status[controller] =
+ 			readl_relaxed(data->mbox_regs[controller] +
+@@ -752,12 +805,17 @@ static ssize_t status_show(struct device *dev,
+ 		"a2b_now=m0:%#x mailmsg_notify=%d "
+ 		"notify_inject=%u/%d/%u "
+ 		"mailmsg_tx_full=valid:%u/commit:%u/count:%u/priority:%u/type:%u/result:%d "
++		"mailmsg_worker=valid:%u/commit:%u/irq:%u/wake:%u/drain:%u/msg:%u/empty:%u/last:%#x/pending:%#x/priority:%u "
+ 		"mbox_observation=%#x/%#x/%#x/%#x magic=%#llx current_el=%llu\n",
+ 		a2b_now_status[0], data->mailmsg_last_notify_result,
+ 		data->notify_inject_priority, data->notify_inject_errno,
+ 		data->notify_inject_remaining,
+ 		tx_full_valid, tx_full_commit_second, tx_full_count,
+ 		tx_full_priority, tx_full_type, tx_full_result,
++		worker_valid, worker_commit_second, worker_irq_count,
++		worker_wake_count, worker_drain_count, worker_message_count,
++		worker_empty_wake_count, worker_last_pending,
++		worker_pending_now, worker_last_priority,
+ 		observation_magic, observation_status,
+ 		observation_cmd, observation_data, magic, current_el);
+ 	mutex_unlock(&data->lock);
+@@ -1672,8 +1730,8 @@ static ssize_t start_store(struct device *dev,
+ 		goto out;
+ 	}
+ 
+-	/* Legacy heartbeat/ping occupies the first 0x180 bytes.  MailMsg starts
+-	 * at 0x200 and is initialized before CPU3 can observe the doorbell. */
++	/* Legacy control and diagnostics occupy the first 0x200 bytes.  MailMsg
++	 * starts at 0x200 and is initialized before CPU3 sees a doorbell. */
+ 	data->session_generation++;
+ 	if (!data->session_generation)
+ 		data->session_generation++;
+-- 
+2.55.0
+

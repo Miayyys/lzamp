@@ -1,0 +1,38 @@
+--- a/flask_server.py
++++ b/flask_server.py
+@@ -280,7 +280,11 @@
+         rkllm_param.extend_param.n_batch = 1
+         rkllm_param.extend_param.use_cross_attn = 0
+         rkllm_param.extend_param.enabled_cpus_num = 4
+-        if platform.lower() in ["rk3576", "rk3588"]:
++        if platform.lower() == "rk3588-r7":
++            # Linux logical CPUs 3-6 are the four RK3588 big cores after
++            # physical A55 CPU3 (MPIDR 0x300) is assigned to Zephyr.
++            rkllm_param.extend_param.enabled_cpus_mask = (1 << 3)|(1 << 4)|(1 << 5)|(1 << 6)
++        elif platform.lower() in ["rk3576", "rk3588"]:
+             rkllm_param.extend_param.enabled_cpus_mask = (1 << 4)|(1 << 5)|(1 << 6)|(1 << 7)
+         else:
+             rkllm_param.extend_param.enabled_cpus_mask = (1 << 0)|(1 << 1)|(1 << 2)|(1 << 3)
+@@ -702,7 +706,7 @@
+         sys.stdout.flush()
+         exit()
+ 
+-    if not (args.target_platform in ["rk3588", "rk3576", "rv1126b", "rk3562"]):
++    if not (args.target_platform in ["rk3588", "rk3588-r7", "rk3576", "rv1126b", "rk3562"]):
+         print("Error: Please specify the correct target platform: rk3588/rk3576/rv1126b/rk3562.")
+         sys.stdout.flush()
+         exit()
+@@ -720,8 +724,11 @@
+             exit()
+ 
+     # Fix frequency
+-    command = "sudo bash fix_freq_{}.sh".format(args.target_platform)
+-    subprocess.run(command, shell=True)
++    if args.target_platform == "rk3588-r7":
++        print("Skipping the stock frequency script for the seven-core R7 AMP layout.")
++    else:
++        command = "sudo bash fix_freq_{}.sh".format(args.target_platform)
++        subprocess.run(command, shell=True)
+ 
+     # Set resource limit
+     resource.setrlimit(resource.RLIMIT_NOFILE, (102400, 102400))

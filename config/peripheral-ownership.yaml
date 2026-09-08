@@ -1,0 +1,190 @@
+schema: 1
+board: lzamp-rk3588s
+policy: mixed-exclusive
+
+# This file records both ownership and the current driver-readiness label.
+# Every resource below is kept unavailable to Linux and reserved for Zephyr.
+zephyr:
+  state: mixed-readiness
+  resources:
+    - id: gpio3_pd1
+      kind: gpio
+      ownership: line-exclusive-controller-shared
+      access_mode: polling
+      header_pin: 19
+      voltage: 3.3
+      gpio_bank: 3
+      gpio_line: 25
+      linux_consumer: none-found-in-final-dts
+      zephyr_driver: polling-input-output-host-tested-board-pending
+    - id: gpio3_pd4
+      kind: gpio
+      ownership: line-exclusive-controller-shared
+      access_mode: polling
+      header_pin: 14
+      voltage: 3.3
+      gpio_bank: 3
+      gpio_line: 28
+      linux_consumer: none-found-in-final-dts
+      zephyr_driver: polling-input-output-host-tested-board-pending
+    - id: gpio3_pd5
+      kind: gpio
+      ownership: line-exclusive-controller-shared
+      access_mode: polling
+      header_pin: 16
+      voltage: 3.3
+      gpio_bank: 3
+      gpio_line: 29
+      linux_consumer: none-found-in-final-dts
+      zephyr_driver: polling-input-output-host-tested-board-pending
+    - id: uart5_m1
+      kind: uart
+      ownership: controller-exclusive
+      mmio: {base: 0xfeb80000, size: 0x100}
+      interrupt: {controller: gic, spi: 336}
+      header_pins: [6, 8]
+      voltage: 3.3
+      gpio_lines: [21, 20]
+      clock_ownership:
+        policy: instance-exclusive-leaf-tree
+        clocks: [PCLK_UART5, CLK_UART5_SRC, CLK_UART5_FRAC, CLK_UART5, SCLK_UART5]
+        resets: [SRST_P_UART5, SRST_S_UART5]
+        forbidden: [shared-pll-control, whole-cru-register-rmw]
+      linux_status: disabled
+      zephyr_driver: polling-host-tested-board-pending
+    - id: uart7_m1
+      kind: uart
+      ownership: controller-exclusive-reserved
+      mmio: {base: 0xfeba0000, size: 0x100}
+      interrupt: {controller: gic, spi: 338}
+      header_pins: [10, 12]
+      voltage: 3.3
+      gpio_lines: [17, 16]
+      clock_ownership:
+        policy: instance-exclusive-leaf-tree
+        clocks: [PCLK_UART7, CLK_UART7_SRC, CLK_UART7_FRAC, CLK_UART7, SCLK_UART7]
+        resets: [SRST_P_UART7, SRST_S_UART7]
+        forbidden: [shared-pll-control, whole-cru-register-rmw]
+      linux_status: disabled
+      zephyr_driver: polling-host-tested-board-pending
+    - id: i2c7_m2
+      kind: i2c
+      ownership: controller-exclusive
+      mmio: {base: 0xfec90000, size: 0x1000}
+      interrupt: {controller: gic, spi: 324}
+      header_pins: [21, 23]
+      voltage: 3.3
+      gpio_lines: [26, 27]
+      clock_ownership:
+        policy: instance-exclusive-leaf-tree
+        clocks: [PCLK_I2C7, CLK_I2C7]
+        resets: [SRST_P_I2C7, SRST_I2C7]
+        forbidden: [shared-pll-control, whole-cru-register-rmw]
+      linux_status: disabled
+      zephyr_driver: polling-host-tested-board-pending
+    - id: spi0_m3
+      kind: spi
+      ownership: controller-exclusive-profile-alternative
+      profile: spi0
+      conflicts_with_profile: i2c7-gpio
+      mmio: {base: 0xfeb00000, size: 0x1000}
+      interrupt: {controller: gic, spi: 326}
+      header_pins: [14, 16, 19, 21, 23]
+      voltage: 3.3
+      gpio_lines: [28, 29, 25, 26, 27]
+      clock_ownership:
+        policy: instance-exclusive-leaf-tree
+        clocks: [PCLK_SPI0, CLK_SPI0]
+        resets: [SRST_P_SPI0, SRST_SPI0]
+        forbidden: [shared-pll-control, whole-cru-register-rmw]
+      linux_status: disabled
+      zephyr_driver: polling-profile-host-tested-board-pending
+    - id: pwm1_bank
+      kind: pwm-bank
+      ownership: controller-bank-exclusive
+      channels: [4, 5, 6, 7]
+      mmio: {base: 0xfebd0000, size: 0x40}
+      interrupts: [{controller: gic, spi: 346}, {controller: gic, spi: 347}]
+      exposed_channel: {channel: 7, header_pin: 18, voltage: 1.8}
+      clock_ownership:
+        policy: bank-exclusive-leaf-tree
+        clocks: [PCLK_PWM1, CLK_PWM1, CLK_PWM1_CAPTURE]
+        resets: [SRST_P_PWM1, SRST_PWM1]
+        forbidden: [shared-pll-control, whole-cru-register-rmw]
+      linux_status: disabled
+      zephyr_driver: pwm7-polling-host-tested-electrical-board-pending
+    - id: saradc
+      kind: adc
+      ownership: controller-exclusive
+      channels: [0, 1, 2, 3, 4, 5, 6, 7]
+      mmio: {base: 0xfec10000, size: 0x10000}
+      interrupt: {controller: gic, spi: 398}
+      exposed_channels:
+        - {channel: 3, header_pin: 24, voltage: 1.8}
+        - {channel: 4, header_pin: 26, voltage: 1.8}
+      clock_ownership:
+        policy: instance-exclusive-leaf-tree
+        clocks: [PCLK_SARADC, CLK_SARADC]
+        resets: [SRST_P_SARADC]
+        forbidden: [shared-pll-control, whole-cru-register-rmw]
+      linux_status: disabled
+      linux_consumer_removed: es8388-headset-key-adc
+      zephyr_driver: polling-host-tested-electrical-board-pending
+
+pinmux_profiles:
+  default: i2c7-gpio
+  alternatives:
+    i2c7-gpio:
+      functions: [i2c7_m2, gpio3_pd1, gpio3_pd4, gpio3_pd5]
+    spi0:
+      functions: [spi0_m3]
+  switch_policy: boot-time-linux-and-zephyr-dt-pair
+
+# GPIO3 remains a Linux-owned controller because unrelated board functions
+# use other lines in the bank.  Zephyr may only access the three reserved
+# lines above and must not change the bank clock/reset or interrupt registers.
+gpio_shared_controller_rules:
+  controller: gpio3
+  reserved_lines: [16, 17, 20, 21, 25, 26, 27, 28, 29]
+  direct_gpio_lines: [25, 28, 29]
+  forbidden_operations:
+    - clock-control
+    - reset-control
+    - bank-interrupt-control
+    - whole-register-read-modify-write
+
+# CRU is always a shared system controller.  Zephyr may operate only the
+# instance-specific clocks/resets listed above.  It must never change shared
+# PLLs, unrelated gates/resets, or an entire CRU register with a normal RMW.
+clock_controller_rules:
+  controller: cru
+  ownership: system-shared
+  write_policy: rockchip-hiword-mask-only
+  assigned_leaf_trees: [uart5, uart7, i2c7, spi0, pwm1, saradc]
+  forbidden_operations:
+    - shared-pll-rate-change
+    - unrelated-clock-gate-change
+    - unrelated-reset-change
+    - whole-register-read-modify-write
+
+# Audited candidates which are deliberately not allocated to Zephyr.
+not_allocated:
+  - id: pwm0-pwm3
+    reason: pmu-domain-and-header-pin-conflicts-not-needed-in-first-allocation
+  - id: pwm8-pwm11
+    reason: pwm11-is-linux-fan-consumer
+  - id: pwm12-pwm15
+    reason: pwm13-backlight-and-pwm15-ir-consumers-remain-unverified
+
+# These apparent expansion GPIOs are intentionally retained by Linux because
+# the inherited EVB4 tree currently assigns them to board-level power/reset.
+linux_protected:
+  - id: gpio1_pa6
+    header_pin: 9
+    consumer: camera-1v2-regulator
+  - id: gpio1_pa4
+    header_pin: 11
+    consumer: dsi0-panel-reset
+  - id: gpio1_pb1
+    header_pin: 15
+    consumer: usb-host-5v-enable

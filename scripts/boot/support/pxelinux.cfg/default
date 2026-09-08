@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+
+default lzamp
+prompt 0
+timeout 1
+
+label lzamp
+	menu label LZAMP Linux 6.12
+	kernel Image
+	fdt rk3588s-lzamp-linux.dtb
+	append earlycon=uart8250,mmio32,0xfeb50000 console=ttyFIQ0 irqchip.gicv3_pseudo_nmi=0 root=PARTUUID=614e0000-0000 rw rootwait rcupdate.rcu_expedited=1 rcu_nocbs=all

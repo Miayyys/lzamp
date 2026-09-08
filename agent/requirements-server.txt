@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Matches the pinned upstream Flask server deployment script.
+# Install on the target Python environment, not the model-conversion environment.
+Flask==2.2.2
+Werkzeug==2.2.2

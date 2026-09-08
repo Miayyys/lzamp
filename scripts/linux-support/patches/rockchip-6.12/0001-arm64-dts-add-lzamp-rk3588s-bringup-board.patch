@@ -1,0 +1,208 @@
+From: LZAMP Project <lzamp@localhost>
+Subject: [PATCH] arm64: dts: rockchip: add LZAMP RK3588S bring-up board
+
+Add the LZAMP RK3588S Linux board description used by AMP validation.
+It excludes A55 CPU3 from Linux, reserves Zephyr memory, wires mailbox0
+to MailMsg, carries the confirmed board fixes, and explicitly reserves
+the first expansion-peripheral set for Zephyr ownership.
+
+---
+diff --git a/arch/arm64/boot/dts/rockchip/Makefile b/arch/arm64/boot/dts/rockchip/Makefile
+index 748dd313e..c636ba667 100644
+--- a/arch/arm64/boot/dts/rockchip/Makefile
++++ b/arch/arm64/boot/dts/rockchip/Makefile
+@@ -442,6 +442,7 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb3-lp4x-v10-rk630-bt656-to-cvbs.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb3-lp4x-v10-sii9022-bt1120-to-hdmi.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb4-lp4x-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb4-lp4x-v10-linux.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-lzamp-linux.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb8-lp4x-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-tablet-rk806-single-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-tablet-v10.dtb
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-lzamp-linux.dts b/arch/arm64/boot/dts/rockchip/rk3588s-lzamp-linux.dts
+new file mode 100644
+index 000000000..f23086fe3
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-lzamp-linux.dts
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Minimal Linux bring-up device tree for the LZAMP RK3588S platform.
++ *
++ * Start from Rockchip's RK3588S EVB4 LP4X description and keep only the
++ * board differences already confirmed by RAM-only boot tests.  Additional
++ * LZAMP peripherals are intentionally left for separate validation steps.
++ */
++
++/dts-v1/;
++
++#include "rk3588s-evb4-lp4x.dtsi"
++#include "rk3588-linux.dtsi"
++
++/ {
++	model = "LZAMP RK3588S";
++	compatible = "lzamp,rk3588s", "rockchip,rk3588";
++
++	amp-cpu-on-heartbeat {
++		compatible = "lzamp,amp-mailmsg";
++		memory-region = <&lzamp_amp_reserved>;
++		mbox-names = "m0ch0", "m0ch1", "m0ch2", "m0ch3";
++		mboxes = <&mailbox0 0>, <&mailbox0 1>,
++			 <&mailbox0 2>, <&mailbox0 3>;
++		target-mpidr = /bits/ 64 <0x300>;
++		zephyr-entry = /bits/ 64 <0x5000100c>;
++		zephyr-image-size = <0x20000>;
++		status-offset = <0x3ff000>;
++		status = "okay";
++	};
++
++	cpus {
++		cpu-map {
++			cluster0 {
++				/delete-node/ core3;
++			};
++		};
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/*
++		 * 32 MiB LZAMP AMP layout:
++		 *   0x50000000 + 4 MiB: Zephyr, control page in final 4 KiB
++		 *   0x50400000 + 1 MiB: P0 reliable data queue
++		 *   0x50500000 + 1 MiB: P1 reliable data queue
++		 *   0x50600000 + 4 MiB: P2 streaming data queue
++		 *   0x50a00000 +16 MiB: P3 video/best-effort data queue
++		 *   0x51a00000 + 6 MiB: future expansion
++		 */
++		lzamp_amp_reserved: lzamp-amp@50000000 {
++			reg = <0x0 0x50000000 0x0 0x02000000>;
++			no-map;
++		};
++	};
++};
++
++&arm_pmu {
++	interrupt-affinity = <&cpu_l0>, <&cpu_l1>, <&cpu_l2>,
++			     <&cpu_b0>, <&cpu_b1>, <&cpu_b2>, <&cpu_b3>;
++};
++
++/delete-node/ &cpu_l3;
++
++&mailbox0 {
++	status = "okay";
++};
++
++/*
++ * First Zephyr-owned expansion set.  Linux keeps the GPIO3 controller for
++ * unrelated board functions, but these line ranges are unavailable to
++ * gpiolib and their alternate-function controllers remain disabled:
++ *
++ *   GPIO3_C4/C5: UART5 M1, header pins 8/6
++ *   GPIO3_D1:    GPIO, header pin 19
++ *   GPIO3_D2/D3: I2C7 M2, header pins 21/23
++ *   GPIO3_D4/D5: GPIO, header pins 14/16
++ *
++ * Driver readiness is tracked separately from this ownership boundary.
++ */
++&gpio3 {
++	gpio-reserved-ranges = <20 2>, <25 5>;
++};
++
++&uart5 {
++	status = "disabled";
++};
++
++&i2c7 {
++	status = "disabled";
++};
++
++/* These controllers overlap the Zephyr-owned GPIO/I2C7 header pins. */
++&uart9 {
++	status = "disabled";
++};
++
++&spi0 {
++	status = "disabled";
++};
++
++/*
++ * The target board routes GMAC1 to an external-clock RGMII PHY at MDIO
++ * address 0.  GPIO3 PB7 resets that PHY; the EVB4 Bluetooth description
++ * also claims PB7, but that device is not fitted on this board.
++ */
++&wireless_bluetooth {
++	status = "disabled";
++};
++
++/* UART8 CTS and GMAC1 RX clock both use GPIO3 PA5 on the EVB4 mux. */
++&uart8 {
++	status = "disabled";
++};
++
++&gmac1 {
++	phy-mode = "rgmii-rxid";
++	clock_in_out = "input";
++
++	snps,reset-gpio = <&gpio3 RK_PB7 GPIO_ACTIVE_LOW>;
++	snps,reset-delays-us = <0 20000 100000>;
++
++	pinctrl-names = "default";
++	pinctrl-0 = <&gmac1_miim
++		     &gmac1_tx_bus2
++		     &gmac1_rx_bus2
++		     &gmac1_rgmii_clk
++		     &gmac1_rgmii_bus
++		     &gmac1_clkinout>;
++
++	tx_delay = <0x44>;
++	rx_delay = <0x18>;
++	phy-handle = <&rgmii_phy1>;
++	status = "okay";
++};
++
++&mdio1 {
++	rgmii_phy1: ethernet-phy@0 {
++		compatible = "ethernet-phy-ieee802.3-c22";
++		reg = <0>;
++	};
++};
++
++/*
++ * The EVB4 routes its FUSB302 and RTC through I2C8.  The target hardware's
++ * 5.10 board description routes those devices through I2C6 instead; probing
++ * the EVB4 FUSB302 location causes continuous address 0x22 timeouts.
++ * Keep this controller disabled until the I2C6 wiring is ported.
++ */
++&i2c8 {
++	status = "disabled";
++};
++
++/*
++ * The target eMMC is stable in HS400 enhanced-strobe mode without CQE.
++ * Enabling the EVB4 CQE property causes repeated recovery and read errors.
++ */
++&sdhci {
++	/delete-property/ supports-cqe;
++};
++
++/* No endpoint is fitted on the PCIe 2.0 lane 1 path. */
++&pcie2x1l1 {
++	status = "disabled";
++};
++
++/*
++ * The M.2 slot containing the MT7922 is PCI domain 4 (pcie2x1l2).
++ * Its PERST# is wired to GPIO4 PA7 on the target hardware, not GPIO4 PC1
++ * as on the EVB4 reference board.
++ */
++&pcie2x1l2 {
++	reset-gpios = <&gpio4 RK_PA7 GPIO_ACTIVE_HIGH>;
++	vpcie3v3-supply = <&vcc3v3_pcie20>;
++	status = "okay";
++};
+-- 
+2.51.0

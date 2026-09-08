@@ -1,0 +1,1022 @@
+From dcb7dfd7b5f734c8d817920129ca4b794d219c9b Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Mon, 31 Aug 2026 22:15:29 +0800
+Subject: [PATCH 11/12] soc: rockchip: add MailMsg R6 lifecycle control
+
+---
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 616 ++++++++++++++++--
+ 1 file changed, 570 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index 4582f3ff0..eedf6e066 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -15,6 +15,7 @@
+ #include <linux/atomic.h>
+ #include <linux/fs.h>
+ #include <linux/io.h>
++#include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/mailbox_client.h>
+ #include <linux/miscdevice.h>
+@@ -63,13 +64,18 @@
+ #define R1_AMP_MBOX_CHANNELS	(R1_AMP_MBOX_CONTROLLERS * \
+ 				 R1_AMP_MBOX_CHANNELS_PER_CONTROLLER)
+ #define R1_AMP_AFFINITY_MONITOR_MS	1000
++#define R1_AMP_LIFECYCLE_TIMEOUT_MS	5000
+ 
+ struct r1_amp_cpu_on_data;
+ 
+ /* Local Linux-side lifecycle only; it is not part of the shared ABI. */
+ enum r1_amp_mailmsg_session_state {
+ 	R1_AMP_MAILMSG_UNARMED,
++	R1_AMP_MAILMSG_STARTING,
++	R1_AMP_MAILMSG_START_TIMEOUT,
+ 	R1_AMP_MAILMSG_ACTIVE,
++	R1_AMP_MAILMSG_STOPPING,
++	R1_AMP_MAILMSG_STOP_TIMEOUT,
+ 	R1_AMP_MAILMSG_OFFLINE,
+ };
+ 
+@@ -157,11 +163,26 @@ struct r1_amp_cpu_on_data {
+ 	int affinity_state;
+ 	int cpu_on_ret;
+ 	bool affinity_queried;
++	bool affinity_seen_on;
+ 	bool cpu_on_attempted;
+ 	enum r1_amp_mailmsg_session_state mailmsg_state;
+ 	struct delayed_work affinity_work;
++	struct work_struct control_work;
++	struct delayed_work lifecycle_timeout_work;
+ 	u32 affinity_monitor_count;
+ 	u32 affinity_monitor_error_count;
++	u32 session_generation;
++	u32 peer_generation;
++	int session_result;
++	u32 stop_request_sequence;
++	u32 stop_reply_type;
++	int stop_result;
++	int stop_notify_result;
++	unsigned long lifecycle_deadline;
++	u32 notify_inject_priority;
++	int notify_inject_errno;
++	u32 notify_inject_remaining;
++	bool lifecycle_notify_bypass;
+ 	u64 next_sequence;
+ 	int mailmsg_last_notify_result;
+ 	struct mailmsg_endpoint mailmsg_endpoint;
+@@ -172,6 +193,11 @@ struct r1_amp_cpu_on_data {
+ 	struct bin_attribute image_attr;
+ };
+ 
++static void r1_amp_mailmsg_control_work(struct work_struct *work);
++static void r1_amp_mailmsg_lifecycle_timeout_work(struct work_struct *work);
++static int mailmsg_ring_result_to_errno(int result);
++static u32 mailmsg_payload_u32(const mailmsg_u8 payload[4]);
++
+ static void r1_amp_mbox_rx_callback(struct mbox_client *client, void *message)
+ {
+ 	struct r1_amp_mbox_channel *channel =
+@@ -186,6 +212,11 @@ static void r1_amp_mbox_rx_callback(struct mbox_client *client, void *message)
+ 	atomic_inc(&channel->rx_count);
+ 	atomic_inc(&channel->parent->mailmsg_user[channel->index].rx_generation);
+ 	wake_up_interruptible(&channel->parent->mailmsg_user[channel->index].rx_wait);
++	if (READ_ONCE(channel->parent->mailmsg_state) ==
++		R1_AMP_MAILMSG_STARTING ||
++	    READ_ONCE(channel->parent->mailmsg_state) ==
++		R1_AMP_MAILMSG_STOPPING)
++		schedule_work(&channel->parent->control_work);
+ }
+ 
+ static const char *r1_amp_psci_state_name(int state)
+@@ -208,8 +239,16 @@ static const char *r1_amp_mailmsg_state_name(
+ 	switch (state) {
+ 	case R1_AMP_MAILMSG_UNARMED:
+ 		return "unarmed";
++	case R1_AMP_MAILMSG_STARTING:
++		return "starting";
++	case R1_AMP_MAILMSG_START_TIMEOUT:
++		return "start-timeout";
+ 	case R1_AMP_MAILMSG_ACTIVE:
+ 		return "active";
++	case R1_AMP_MAILMSG_STOPPING:
++		return "stopping";
++	case R1_AMP_MAILMSG_STOP_TIMEOUT:
++		return "stop-timeout";
+ 	case R1_AMP_MAILMSG_OFFLINE:
+ 		return "offline";
+ 	}
+@@ -217,6 +256,28 @@ static const char *r1_amp_mailmsg_state_name(
+ 	return "unknown";
+ }
+ 
++/* One gate for every data-plane entry point, including test-only sysfs
++ * helpers.  Lifecycle control is the only owner while STARTING/STOPPING. */
++static int r1_amp_mailmsg_data_gate_locked(struct r1_amp_cpu_on_data *data)
++{
++	switch (data->mailmsg_state) {
++	case R1_AMP_MAILMSG_ACTIVE:
++		return 0;
++	case R1_AMP_MAILMSG_STARTING:
++		return -EAGAIN;
++	case R1_AMP_MAILMSG_START_TIMEOUT:
++		return -ETIMEDOUT;
++	case R1_AMP_MAILMSG_STOPPING:
++		return -ESHUTDOWN;
++	case R1_AMP_MAILMSG_STOP_TIMEOUT:
++		return -ETIMEDOUT;
++	case R1_AMP_MAILMSG_OFFLINE:
++	case R1_AMP_MAILMSG_UNARMED:
++		return -ENOLINK;
++	}
++	return -EIO;
++}
++
+ /* Caller holds data->lock.  Wake every priority so blocking readers observe
+  * the terminal endpoint state instead of sleeping for a mailbox IRQ that can
+  * no longer arrive from the stopped CPU. */
+@@ -224,10 +285,15 @@ static void r1_amp_mailmsg_mark_offline_locked(struct r1_amp_cpu_on_data *data)
+ {
+ 	int priority;
+ 
+-	if (data->mailmsg_state != R1_AMP_MAILMSG_ACTIVE)
++	if (data->mailmsg_state != R1_AMP_MAILMSG_STARTING &&
++	    data->mailmsg_state != R1_AMP_MAILMSG_START_TIMEOUT &&
++	    data->mailmsg_state != R1_AMP_MAILMSG_ACTIVE &&
++	    data->mailmsg_state != R1_AMP_MAILMSG_STOPPING &&
++	    data->mailmsg_state != R1_AMP_MAILMSG_STOP_TIMEOUT)
+ 		return;
+ 
+ 	data->mailmsg_state = R1_AMP_MAILMSG_OFFLINE;
++	cancel_delayed_work(&data->lifecycle_timeout_work);
+ 	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
+ 		atomic_inc(&data->mailmsg_user[priority].rx_generation);
+ 		wake_up_interruptible(&data->mailmsg_user[priority].rx_wait);
+@@ -242,7 +308,14 @@ static int r1_amp_refresh_affinity_locked(struct r1_amp_cpu_on_data *data)
+ 	state = psci_ops.affinity_info(data->mpidr, 0);
+ 	data->affinity_state = state;
+ 	data->affinity_queried = true;
+-	if (!data->cpu_on_ret && state == PSCI_0_2_AFFINITY_LEVEL_OFF)
++	if (state == PSCI_0_2_AFFINITY_LEVEL_ON ||
++	    state == PSCI_0_2_AFFINITY_LEVEL_ON_PENDING)
++		data->affinity_seen_on = true;
++	/* CPU_ON may return before firmware changes AFFINITY_INFO away from OFF.
++	 * Require one observed ON/ON_PENDING state before treating a later OFF as
++	 * a terminal peer shutdown. */
++	if (!data->cpu_on_ret && data->affinity_seen_on &&
++	    state == PSCI_0_2_AFFINITY_LEVEL_OFF)
+ 		r1_amp_mailmsg_mark_offline_locked(data);
+ 
+ 	return state;
+@@ -256,7 +329,11 @@ static void r1_amp_affinity_work(struct work_struct *work)
+ 	int state;
+ 
+ 	mutex_lock(&data->lock);
+-	if (data->mailmsg_state != R1_AMP_MAILMSG_ACTIVE ||
++	if ((data->mailmsg_state != R1_AMP_MAILMSG_STARTING &&
++	     data->mailmsg_state != R1_AMP_MAILMSG_START_TIMEOUT &&
++	     data->mailmsg_state != R1_AMP_MAILMSG_ACTIVE &&
++	     data->mailmsg_state != R1_AMP_MAILMSG_STOPPING &&
++	     data->mailmsg_state != R1_AMP_MAILMSG_STOP_TIMEOUT) ||
+ 	    data->mailmsg_user_removing)
+ 		goto out;
+ 
+@@ -264,7 +341,17 @@ static void r1_amp_affinity_work(struct work_struct *work)
+ 	state = r1_amp_refresh_affinity_locked(data);
+ 	if (state < 0)
+ 		data->affinity_monitor_error_count++;
+-	if (data->mailmsg_state == R1_AMP_MAILMSG_ACTIVE &&
++	/* A coalesced lifecycle doorbell must not create a lost-wakeup window.
++	 * While the lifecycle plane owns p0, periodically drain it as a fallback
++	 * in addition to mailbox callbacks. */
++	if (data->mailmsg_state == R1_AMP_MAILMSG_STARTING ||
++	    data->mailmsg_state == R1_AMP_MAILMSG_STOPPING)
++		schedule_work(&data->control_work);
++	if ((data->mailmsg_state == R1_AMP_MAILMSG_STARTING ||
++	     data->mailmsg_state == R1_AMP_MAILMSG_START_TIMEOUT ||
++	     data->mailmsg_state == R1_AMP_MAILMSG_ACTIVE ||
++	     data->mailmsg_state == R1_AMP_MAILMSG_STOPPING ||
++	     data->mailmsg_state == R1_AMP_MAILMSG_STOP_TIMEOUT) &&
+ 	    !data->mailmsg_user_removing)
+ 		mod_delayed_work(system_wq, &data->affinity_work,
+ 				 msecs_to_jiffies(R1_AMP_AFFINITY_MONITOR_MS));
+@@ -272,6 +359,154 @@ static void r1_amp_affinity_work(struct work_struct *work)
+ 	mutex_unlock(&data->lock);
+ }
+ 
++/* Caller holds data->lock.  A timeout is a terminal lifecycle result: late
++ * control frames cannot silently reopen or complete the expired operation. */
++static void r1_amp_mailmsg_set_timeout_locked(struct r1_amp_cpu_on_data *data)
++{
++	int priority;
++
++	if (data->mailmsg_state == R1_AMP_MAILMSG_STARTING) {
++		data->session_result = -ETIMEDOUT;
++		data->mailmsg_state = R1_AMP_MAILMSG_START_TIMEOUT;
++	} else if (data->mailmsg_state == R1_AMP_MAILMSG_STOPPING) {
++		data->stop_result = -ETIMEDOUT;
++		data->mailmsg_state = R1_AMP_MAILMSG_STOP_TIMEOUT;
++	}
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		atomic_inc(&data->mailmsg_user[priority].rx_generation);
++		wake_up_interruptible(&data->mailmsg_user[priority].rx_wait);
++	}
++}
++
++/* SESSION_READY and stop replies are consumed only by the kernel lifecycle
++ * plane.  User traffic is closed in STARTING/STOPPING, so p0 has one reader. */
++static void r1_amp_mailmsg_control_work(struct work_struct *work)
++{
++	struct r1_amp_cpu_on_data *data =
++		container_of(work, struct r1_amp_cpu_on_data, control_work);
++	struct mailmsg_message response;
++	int ret;
++
++	mutex_lock(&data->lock);
++	if (data->mailmsg_state != R1_AMP_MAILMSG_STARTING &&
++	    data->mailmsg_state != R1_AMP_MAILMSG_STOPPING)
++		goto out;
++	if (time_after_eq(jiffies, data->lifecycle_deadline)) {
++		r1_amp_mailmsg_set_timeout_locked(data);
++		cancel_delayed_work(&data->lifecycle_timeout_work);
++		goto out;
++	}
++
++	for (;;) {
++		ret = mailmsg_endpoint_receive(&data->mailmsg_endpoint,
++					       MAILMSG_PRIO_CRITICAL, &response);
++		if (ret == MAILMSG_RING_EMPTY || ret == MAILMSG_RING_INCOMPLETE)
++			break;
++		if (ret) {
++			/* A stale-generation frame was consumed and released.  Keep
++			 * draining for the current session's lifecycle response. */
++			if (ret == MAILMSG_ENDPOINT_STALE_FRAME)
++				continue;
++			if (data->mailmsg_state == R1_AMP_MAILMSG_STARTING)
++				data->session_result = mailmsg_ring_result_to_errno(ret);
++			else
++				data->stop_result = mailmsg_ring_result_to_errno(ret);
++			/* Endpoint/session errors do not consume a ring entry.  Retrying
++			 * under the same mutex would spin forever; leave the lifecycle
++			 * timeout as the safe terminal observation. */
++			if (ret <= MAILMSG_ENDPOINT_INVALID)
++				break;
++			continue;
++		}
++		if (time_after_eq(jiffies, data->lifecycle_deadline)) {
++			r1_amp_mailmsg_set_timeout_locked(data);
++			cancel_delayed_work(&data->lifecycle_timeout_work);
++			break;
++		}
++
++		if (data->mailmsg_state == R1_AMP_MAILMSG_STARTING) {
++			if (response.type != MAILMSG_MSG_SESSION_READY ||
++			    response.length < MAILMSG_SESSION_BYTES ||
++			    mailmsg_payload_u32(
++				&response.payload[MAILMSG_SESSION_GENERATION_OFFSET]) !=
++					data->session_generation ||
++			    mailmsg_payload_u32(
++				&response.payload[MAILMSG_SESSION_VERSION_OFFSET]) !=
++					MAILMSG_PROTOCOL_VERSION)
++				continue;
++
++			data->peer_generation = data->session_generation;
++			data->session_result = 0;
++			/* A generation-matched frame is stronger evidence than a sampled
++			 * PSCI state: CPU3 has executed the new image in this session. */
++			data->affinity_seen_on = true;
++			data->mailmsg_state = R1_AMP_MAILMSG_ACTIVE;
++			cancel_delayed_work(&data->lifecycle_timeout_work);
++			break;
++		}
++
++		if ((response.type != MAILMSG_MSG_STOP_READY &&
++		     response.type != MAILMSG_MSG_STOP_REFUSED) ||
++		    response.length < MAILMSG_FEEDBACK_BYTES ||
++		    mailmsg_payload_u32(
++				&response.payload[MAILMSG_FEEDBACK_SEQUENCE_OFFSET]) !=
++				data->stop_request_sequence)
++			continue;
++
++		if (response.type == MAILMSG_MSG_STOP_READY) {
++			data->stop_reply_type = response.type;
++			data->stop_result = 0;
++			/* STOP_READY ends the reply phase.  Give PSCI CPU_OFF its own
++			 * bounded interval instead of reusing the original deadline. */
++			data->lifecycle_deadline = jiffies +
++				msecs_to_jiffies(R1_AMP_LIFECYCLE_TIMEOUT_MS);
++			mod_delayed_work(system_wq, &data->lifecycle_timeout_work,
++					 msecs_to_jiffies(R1_AMP_LIFECYCLE_TIMEOUT_MS));
++			break;
++		}
++
++		/* A refusal leaves CPU3 running and reopens the normal data plane. */
++		data->stop_reply_type = response.type;
++		data->stop_result = -ECANCELED;
++		data->mailmsg_state = R1_AMP_MAILMSG_ACTIVE;
++		cancel_delayed_work(&data->lifecycle_timeout_work);
++		break;
++	}
++out:
++	mutex_unlock(&data->lock);
++}
++
++static void r1_amp_mailmsg_lifecycle_timeout_work(struct work_struct *work)
++{
++	struct r1_amp_cpu_on_data *data =
++		container_of(to_delayed_work(work), struct r1_amp_cpu_on_data,
++			     lifecycle_timeout_work);
++	unsigned long remaining;
++
++	mutex_lock(&data->lock);
++	if (data->mailmsg_state != R1_AMP_MAILMSG_STARTING &&
++	    data->mailmsg_state != R1_AMP_MAILMSG_STOPPING)
++		goto out;
++	if (time_before(jiffies, data->lifecycle_deadline)) {
++		remaining = data->lifecycle_deadline - jiffies;
++		mod_delayed_work(system_wq, &data->lifecycle_timeout_work,
++				 remaining);
++		goto out;
++	}
++	/* Avoid reporting a STOP timeout merely because the periodic affinity
++	 * sampler has not yet observed a CPU that is already OFF. */
++	if (data->mailmsg_state == R1_AMP_MAILMSG_STOPPING &&
++	    data->stop_reply_type == MAILMSG_MSG_STOP_READY) {
++		r1_amp_refresh_affinity_locked(data);
++		if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE)
++			goto out;
++	}
++
++	r1_amp_mailmsg_set_timeout_locked(data);
++out:
++	mutex_unlock(&data->lock);
++}
++
+ static void *r1_amp_status_ptr(struct r1_amp_cpu_on_data *data)
+ {
+ 	return data->carveout + data->status_offset;
+@@ -340,7 +575,8 @@ static int mailmsg_linux_ring_push(struct mailmsg_ring *ring,
+ 	mailmsg_u32 next = (producer + 1U) % MAILMSG_RING_SLOTS;
+ 	struct mailmsg_message *slot;
+ 
+-	if (!message->sequence || message->length > MAILMSG_PAYLOAD_BYTES)
++	if (!message->generation || !message->sequence ||
++	    message->length > MAILMSG_PAYLOAD_BYTES)
+ 		return -EINVAL;
+ 	mailmsg_linux_acquire(&ring->consumer, sizeof(ring->consumer));
+ 	if (next == ring->consumer)
+@@ -485,10 +721,14 @@ static ssize_t status_show(struct device *dev,
+ 				      R1_AMP_MBOX_A2B_STATUS);
+ 	ch = data->mbox;
+ 	ret = sysfs_emit(buf,
+-		"image=%zu/%u affinity=%s (%d) mailmsg_state=%s affinity_monitor=%u/%u cpu_on_attempted=%u cpu_on_ret=%d ",
++		"image=%zu/%u affinity=%s (%d) affinity_seen_on=%u mailmsg_state=%s session=%u/%u session_result=%d stop_sequence=%u stop_reply=%u stop_result=%d stop_notify=%d affinity_monitor=%u/%u cpu_on_attempted=%u cpu_on_ret=%d ",
+ 		data->image_written, data->image_size,
+ 		data->affinity_queried ? r1_amp_psci_state_name(data->affinity_state) : "not-queried",
+-		data->affinity_state, r1_amp_mailmsg_state_name(data->mailmsg_state),
++		data->affinity_state, data->affinity_seen_on,
++		r1_amp_mailmsg_state_name(data->mailmsg_state),
++		data->session_generation, data->peer_generation,
++		data->session_result, data->stop_request_sequence,
++		data->stop_reply_type, data->stop_result, data->stop_notify_result,
+ 		data->affinity_monitor_count, data->affinity_monitor_error_count,
+ 		data->cpu_on_attempted, data->cpu_on_ret);
+ 	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++) {
+@@ -510,9 +750,12 @@ static ssize_t status_show(struct device *dev,
+ 	}
+ 	ret += sysfs_emit_at(buf, ret,
+ 		"a2b_now=m0:%#x mailmsg_notify=%d "
++		"notify_inject=%u/%d/%u "
+ 		"mailmsg_tx_full=valid:%u/commit:%u/count:%u/priority:%u/type:%u/result:%d "
+ 		"mbox_observation=%#x/%#x/%#x/%#x magic=%#llx current_el=%llu\n",
+ 		a2b_now_status[0], data->mailmsg_last_notify_result,
++		data->notify_inject_priority, data->notify_inject_errno,
++		data->notify_inject_remaining,
+ 		tx_full_valid, tx_full_commit_second, tx_full_count,
+ 		tx_full_priority, tx_full_type, tx_full_result,
+ 		observation_magic, observation_status,
+@@ -523,6 +766,41 @@ static ssize_t status_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(status);
+ 
++static ssize_t mailmsg_stats_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	ssize_t ret = 0;
++	int priority;
++
++	mutex_lock(&data->lock);
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		const struct mailmsg_priority_stats *stats =
++			&data->mailmsg_endpoint.stats.priority[priority];
++		int tx_depth = -1, rx_depth = -1;
++
++		if (data->mailmsg_endpoint.tx && data->mailmsg_endpoint.rx) {
++			tx_depth = mailmsg_ring_count(
++				&data->mailmsg_endpoint.tx[priority],
++				&mailmsg_linux_memory_ops);
++			rx_depth = mailmsg_ring_count(
++				&data->mailmsg_endpoint.rx[priority],
++				&mailmsg_linux_memory_ops);
++		}
++		ret += sysfs_emit_at(buf, ret,
++			"p%d tx=%u full=%u high=%u depth=%d notify=%u/%u/%u rx=%u incomplete=%u crc=%u invalid=%u stale=%u depth=%d\n",
++			priority, stats->tx_enqueued, stats->tx_full,
++			stats->tx_high_water, tx_depth, stats->notify_sent,
++			stats->notify_coalesced, stats->notify_failed, stats->rx_ok,
++			stats->rx_incomplete, stats->rx_bad_crc, stats->rx_invalid,
++			stats->rx_stale,
++			rx_depth);
++	}
++	mutex_unlock(&data->lock);
++	return ret;
++}
++static DEVICE_ATTR_RO(mailmsg_stats);
++
+ /* Unlike status, this reads PSCI_AFFINITY_INFO for every sysfs read. */
+ static ssize_t affinity_state_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+@@ -558,10 +836,9 @@ static ssize_t ping_store(struct device *dev, struct device_attribute *attr,
+ 		return ret;
+ 
+ 	mutex_lock(&data->lock);
+-	if (!data->cpu_on_attempted || data->cpu_on_ret) {
+-		ret = -ENODEV;
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (ret)
+ 		goto out;
+-	}
+ 
+ 	sequence = ++data->next_sequence;
+ 	if (!sequence)
+@@ -628,10 +905,9 @@ static ssize_t doorbell_store(struct device *dev, struct device_attribute *attr,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&data->lock);
+-	if (!data->cpu_on_attempted || data->cpu_on_ret) {
+-		ret = -ENODEV;
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (ret)
+ 		goto out;
+-	}
+ 
+ 	channel = &data->mbox[index];
+ 	channel->tx_msg.cmd = 0xa2b00000U | index;
+@@ -664,6 +940,13 @@ static int mailmsg_ring_result_to_errno(int result)
+ 		return -EBADMSG;
+ 	case MAILMSG_RING_INVALID:
+ 		return -EPROTO;
++	case MAILMSG_ENDPOINT_INVALID:
++		return -EINVAL;
++	case MAILMSG_ENDPOINT_PROTOCOL_MISMATCH:
++		return -EPROTO;
++	case MAILMSG_ENDPOINT_STALE_SESSION:
++	case MAILMSG_ENDPOINT_STALE_FRAME:
++		return -ESTALE;
+ 	default:
+ 		return -EIO;
+ 	}
+@@ -679,6 +962,7 @@ static int r1_amp_mailmsg_user_open(struct inode *inode, struct file *file)
+ 	struct r1_amp_mailmsg_user_channel *channel;
+ 	struct r1_amp_cpu_on_data *data;
+ 	struct r1_amp_mailmsg_user_file *user_file;
++	int ret;
+ 
+ 	user_file = kzalloc(sizeof(*user_file), GFP_KERNEL);
+ 	if (!user_file)
+@@ -693,10 +977,11 @@ static int r1_amp_mailmsg_user_open(struct inode *inode, struct file *file)
+ 		kfree(user_file);
+ 		return -ENODEV;
+ 	}
+-	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (ret) {
+ 		mutex_unlock(&data->lock);
+ 		kfree(user_file);
+-		return -ENOLINK;
++		return ret;
+ 	}
+ 	atomic_inc(&data->mailmsg_user_open_count);
+ 	mutex_unlock(&data->lock);
+@@ -761,11 +1046,8 @@ static ssize_t r1_amp_mailmsg_user_read(struct file *file, char __user *buf,
+ 	for (;;) {
+ 		generation = atomic_read(&channel->rx_generation);
+ 		mutex_lock(&data->lock);
+-		if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
+-			ret = -ENOLINK;
+-		} else if (!data->cpu_on_attempted || data->cpu_on_ret) {
+-			ret = -ENODEV;
+-		} else {
++		ret = r1_amp_mailmsg_data_gate_locked(data);
++		if (!ret) {
+ 			ret = mailmsg_endpoint_receive(&data->mailmsg_endpoint,
+ 					(enum mailmsg_priority)channel->priority,
+ 					&message);
+@@ -782,7 +1064,9 @@ static ssize_t r1_amp_mailmsg_user_read(struct file *file, char __user *buf,
+ 				return -EFAULT;
+ 			return sizeof(frame);
+ 		}
+-		if (ret == -ENODEV || ret == -ENOLINK)
++		if (ret == -EAGAIN)
++			return ret;
++		if (ret == -ENOLINK || ret == -ESHUTDOWN)
+ 			return ret;
+ 		if (ret != MAILMSG_RING_EMPTY)
+ 			return mailmsg_ring_result_to_errno(ret);
+@@ -815,22 +1099,22 @@ static ssize_t r1_amp_mailmsg_user_write(struct file *file,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&data->lock);
+-	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
+-		ret = -ENOLINK;
+-	} else if (!data->cpu_on_attempted || data->cpu_on_ret) {
+-		ret = -ENODEV;
+-	} else {
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (!ret) {
+ 		ret = mailmsg_endpoint_send(&data->mailmsg_endpoint,
+ 					(enum mailmsg_priority)channel->priority,
+ 					frame.type, frame.payload, frame.length,
+ 					&send_result);
+ 	}
+ 	mutex_unlock(&data->lock);
+-	if (ret == -ENODEV || ret == -ENOLINK)
++	if (ret == -EAGAIN || ret == -ENOLINK || ret == -ESHUTDOWN)
+ 		return ret;
+ 
+-	if (ret)
++	if (ret) {
++		if (ret <= MAILMSG_ENDPOINT_INVALID)
++			return mailmsg_ring_result_to_errno(ret);
+ 		return mailmsg_ring_result_to_errno(send_result.queue_result);
++	}
+ 
+ 	return sizeof(frame);
+ }
+@@ -848,10 +1132,13 @@ static __poll_t r1_amp_mailmsg_user_poll(struct file *file,
+ 
+ 	poll_wait(file, &channel->rx_wait, wait);
+ 	mutex_lock(&data->lock);
+-	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
++	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE ||
++	    data->mailmsg_state == R1_AMP_MAILMSG_STOPPING) {
+ 		mask = EPOLLHUP | EPOLLERR;
+-	} else if (data->cpu_on_attempted && !data->cpu_on_ret &&
+-	    mailmsg_endpoint_has_received(&data->mailmsg_endpoint,
++	} else if (data->mailmsg_state == R1_AMP_MAILMSG_STARTING) {
++		mask = EPOLLERR;
++	} else if (data->mailmsg_state == R1_AMP_MAILMSG_ACTIVE &&
++		    mailmsg_endpoint_has_received(&data->mailmsg_endpoint,
+ 					  (enum mailmsg_priority)channel->priority) > 0)
+ 		mask = EPOLLIN | EPOLLRDNORM;
+ 	mutex_unlock(&data->lock);
+@@ -919,11 +1206,13 @@ static int mailmsg_test_enqueue_locked(struct r1_amp_cpu_on_data *data,
+ 	shared = mailmsg_linux_shared_ptr(data);
+ 	mailmsg_linux_acquire(shared, sizeof(*shared));
+ 	if (shared->magic != MAILMSG_PROTOCOL_MAGIC ||
+-	    shared->version != MAILMSG_PROTOCOL_VERSION) {
++	    shared->version != MAILMSG_PROTOCOL_VERSION ||
++	    shared->generation != data->mailmsg_endpoint.generation) {
+ 		return -EPROTO;
+ 	}
+ 
+ 	request.type = MAILMSG_MSG_PING;
++	request.generation = data->mailmsg_endpoint.generation;
+ 	request.sequence = ++data->mailmsg_endpoint.next_sequence;
+ 	if (!request.sequence)
+ 		request.sequence = ++data->mailmsg_endpoint.next_sequence;
+@@ -944,6 +1233,17 @@ static int mailmsg_notify_locked(struct r1_amp_cpu_on_data *data, u32 priority)
+ 	u32 status;
+ 	int result;
+ 
++	if (!data->lifecycle_notify_bypass && data->notify_inject_remaining &&
++	    data->notify_inject_priority == priority) {
++		data->notify_inject_remaining--;
++		result = data->notify_inject_errno;
++		channel->tx_ret = result;
++		channel->notify_failed_count++;
++		channel->notify_result = result;
++		data->mailmsg_last_notify_result = result;
++		return result;
++	}
++
+ 	channel->tx_msg.cmd = R1_AMP_MAILMSG_DOORBELL | priority;
+ 	channel->tx_msg.data = priority;
+ 	status = readl_relaxed(data->mbox_regs[channel->controller] +
+@@ -989,7 +1289,7 @@ static ssize_t mailmsg_send_ping(struct device *dev, const char *buf,
+ 				 size_t count, bool corrupt_payload)
+ {
+ 	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
+-	struct mailmsg_send_result send_result;
++	struct mailmsg_send_result send_result = { };
+ 	mailmsg_u8 payload[sizeof(u32)];
+ 	u32 priority, value;
+ 	int ret;
+@@ -999,10 +1299,9 @@ static ssize_t mailmsg_send_ping(struct device *dev, const char *buf,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&data->lock);
+-	if (!data->cpu_on_attempted || data->cpu_on_ret) {
+-		ret = -ENODEV;
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (ret)
+ 		goto out;
+-	}
+ 
+ 	if (corrupt_payload) {
+ 		ret = mailmsg_test_enqueue_locked(data, priority, value, true);
+@@ -1016,7 +1315,11 @@ static ssize_t mailmsg_send_ping(struct device *dev, const char *buf,
+ 					    MAILMSG_MSG_PING, payload,
+ 					    sizeof(payload), &send_result);
+ 		if (ret) {
+-			ret = mailmsg_ring_result_to_errno(send_result.queue_result);
++			if (ret <= MAILMSG_ENDPOINT_INVALID)
++				ret = mailmsg_ring_result_to_errno(ret);
++			else
++				ret = mailmsg_ring_result_to_errno(
++					send_result.queue_result);
+ 			goto out;
+ 		}
+ 		ret = send_result.notify_result;
+@@ -1042,6 +1345,111 @@ static ssize_t mailmsg_ping_store(struct device *dev,
+ }
+ static DEVICE_ATTR_WO(mailmsg_ping);
+ 
++/* A controlled stop begins only after user space has drained and closed every
++ * priority device.  The kernel then owns p0 solely to observe STOP_READY or
++ * STOP_REFUSED; existing queued business frames are never discarded to make
++ * room for lifecycle control. */
++static int r1_amp_mailmsg_stop_preflight_locked(
++		struct r1_amp_cpu_on_data *data)
++{
++	struct mailmsg_shared *shared = mailmsg_linux_shared_ptr(data);
++	int priority;
++	int ret;
++
++	if (atomic_read(&data->mailmsg_user_open_count))
++		return -EBUSY;
++	if (!data->mailmsg_endpoint.tx || !data->mailmsg_endpoint.rx)
++		return -EPROTO;
++
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		ret = mailmsg_endpoint_has_received(&data->mailmsg_endpoint,
++						    priority);
++		if (ret != MAILMSG_RING_EMPTY)
++			return ret > 0 ? -EBUSY : mailmsg_ring_result_to_errno(ret);
++		ret = mailmsg_ring_has_data(&shared->linux_to_cpu3[priority],
++					    &mailmsg_linux_memory_ops);
++		if (ret != MAILMSG_RING_EMPTY)
++			return ret > 0 ? -EBUSY : mailmsg_ring_result_to_errno(ret);
++	}
++
++	/* Do not merge the lifecycle request into an earlier unobserved doorbell. */
++	if (readl_relaxed(data->mbox_regs[0] + R1_AMP_MBOX_A2B_STATUS) & 0xfU)
++		return -EBUSY;
++
++	return 0;
++}
++
++/* Root-only lifecycle entry point.  This does not wait for CPU_OFF: a sysfs
++ * store must not hold data->lock across the peer's response.  Status exposes
++ * STOP_READY/REFUSED progress; the affinity worker remains the final OFF
++ * authority. */
++static ssize_t mailmsg_stop_store(struct device *dev,
++				  struct device_attribute *attr, const char *buf,
++				  size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	struct mailmsg_send_result send_result = { };
++	int ret;
++
++	if (!sysfs_streq(buf, "stop"))
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
++		ret = -ENOLINK;
++		goto out;
++	}
++	if (data->mailmsg_state != R1_AMP_MAILMSG_ACTIVE) {
++		ret = -EBUSY;
++		goto out;
++	}
++	ret = r1_amp_mailmsg_stop_preflight_locked(data);
++	if (ret)
++		goto out;
++
++	data->mailmsg_state = R1_AMP_MAILMSG_STOPPING;
++	data->stop_request_sequence = 0;
++	data->stop_reply_type = 0;
++	data->stop_result = -EINPROGRESS;
++	data->stop_notify_result = -EINPROGRESS;
++	/* Fault injection validates the business notification adapter.  It must
++	 * never strand a lifecycle request in STOPPING. */
++	data->lifecycle_notify_bypass = true;
++	ret = mailmsg_endpoint_send(&data->mailmsg_endpoint,
++				    MAILMSG_PRIO_CRITICAL,
++				    MAILMSG_MSG_STOP_REQUEST, NULL, 0, &send_result);
++	data->lifecycle_notify_bypass = false;
++	if (ret) {
++		/* No frame was committed when endpoint_send() reports a queue error. */
++		data->mailmsg_state = R1_AMP_MAILMSG_ACTIVE;
++		if (ret <= MAILMSG_ENDPOINT_INVALID)
++			data->stop_result = mailmsg_ring_result_to_errno(ret);
++		else
++			data->stop_result = mailmsg_ring_result_to_errno(
++				send_result.queue_result);
++		ret = data->stop_result;
++		goto out;
++	}
++
++	data->stop_request_sequence = send_result.sequence;
++	data->stop_notify_result = send_result.notify_result;
++	data->lifecycle_deadline = jiffies +
++		msecs_to_jiffies(R1_AMP_LIFECYCLE_TIMEOUT_MS);
++	mod_delayed_work(system_wq, &data->lifecycle_timeout_work,
++			 msecs_to_jiffies(R1_AMP_LIFECYCLE_TIMEOUT_MS));
++	/* Queue admission is durable; retain STOPPING if the doorbell failed so
++	 * later business writes cannot race a request that CPU3 may still observe. */
++	ret = send_result.notify_result;
++	if (!mailmsg_notify_accepted(ret) && ret < 0)
++		dev_warn(dev, "MailMsg STOP_REQUEST queued but notify failed: %d\n", ret);
++	else
++		ret = 0;
++out:
++	mutex_unlock(&data->lock);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(mailmsg_stop);
++
+ /*
+  * Test-only entry point.  Input matches mailmsg_ping ("priority value"),
+  * but one payload byte is changed after CRC generation.  The frame keeps a
+@@ -1055,6 +1463,40 @@ static ssize_t mailmsg_crc_inject_store(struct device *dev,
+ }
+ static DEVICE_ATTR_WO(mailmsg_crc_inject);
+ 
++/* Test-only notification failure injection.  A committed frame is retained;
++ * only the selected next N doorbells return the requested negative errno. */
++static ssize_t mailmsg_notify_inject_store(struct device *dev,
++					   struct device_attribute *attr,
++					   const char *buf, size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	u32 priority, remaining;
++	int injected_errno;
++	int ret = 0;
++
++	mutex_lock(&data->lock);
++	if (sysfs_streq(buf, "clear")) {
++		data->notify_inject_remaining = 0;
++		goto out;
++	}
++	if (sscanf(buf, "%u %d %u", &priority, &injected_errno, &remaining) != 3 ||
++	    priority >= MAILMSG_PRIORITY_COUNT || injected_errno >= 0 ||
++	    injected_errno < -MAX_ERRNO || !remaining || remaining > 1000) {
++		ret = -EINVAL;
++		goto out;
++	}
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (ret)
++		goto out;
++	data->notify_inject_priority = priority;
++	data->notify_inject_errno = injected_errno;
++	data->notify_inject_remaining = remaining;
++out:
++	mutex_unlock(&data->lock);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(mailmsg_notify_inject);
++
+ /* Test-only queue boundary hook.  It intentionally omits a doorbell and may
+  * run before CPU3 starts, so a test can observe the ring's immediate -ENOSPC
+  * result without mailbox state or remote scheduling influencing the result. */
+@@ -1071,13 +1513,15 @@ static ssize_t mailmsg_queue_push_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&data->lock);
+-	ret = mailmsg_test_enqueue_locked(data, priority, value, false);
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (!ret)
++		ret = mailmsg_test_enqueue_locked(data, priority, value, false);
+ 	mutex_unlock(&data->lock);
+ 	return ret ? ret : count;
+ }
+ static DEVICE_ATTR_WO(mailmsg_queue_push);
+ 
+-/* Drain independent reverse rings.  V3 feedback frames carry the original
++	/* Drain independent reverse rings.  Feedback frames carry the original
+  * sequence in payload[0..3], followed by ACK status or NACK reason. */
+ static ssize_t mailmsg_response_show(struct device *dev,
+ 				     struct device_attribute *attr, char *buf)
+@@ -1092,6 +1536,29 @@ static ssize_t mailmsg_response_show(struct device *dev,
+ 		ret = sysfs_emit(buf, "valid=0 reason=protocol-not-ready\n");
+ 		goto out;
+ 	}
++	ret = r1_amp_mailmsg_data_gate_locked(data);
++	if (ret) {
++		const char *reason;
++
++		switch (data->mailmsg_state) {
++		case R1_AMP_MAILMSG_STARTING:
++		case R1_AMP_MAILMSG_STOPPING:
++			reason = "lifecycle-pending";
++			break;
++		case R1_AMP_MAILMSG_START_TIMEOUT:
++		case R1_AMP_MAILMSG_STOP_TIMEOUT:
++			reason = "lifecycle-timeout";
++			break;
++		case R1_AMP_MAILMSG_OFFLINE:
++			reason = "offline";
++			break;
++		default:
++			reason = "unarmed";
++			break;
++		}
++		ret = sysfs_emit(buf, "valid=0 reason=%s\n", reason);
++		goto out;
++	}
+ 
+ 	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
+ 		int pop_ret;
+@@ -1103,7 +1570,8 @@ static ssize_t mailmsg_response_show(struct device *dev,
+ 			if (pop_ret) {
+ 				ret += sysfs_emit_at(buf, ret,
+ 					"priority=%d valid=0 ret=%d\n", priority, pop_ret);
+-				if (pop_ret == MAILMSG_RING_INCOMPLETE)
++				if (pop_ret == MAILMSG_RING_INCOMPLETE ||
++				    pop_ret <= MAILMSG_ENDPOINT_INVALID)
+ 					break;
+ 				continue;
+ 			}
+@@ -1206,9 +1674,13 @@ static ssize_t start_store(struct device *dev,
+ 
+ 	/* Legacy heartbeat/ping occupies the first 0x180 bytes.  MailMsg starts
+ 	 * at 0x200 and is initialized before CPU3 can observe the doorbell. */
++	data->session_generation++;
++	if (!data->session_generation)
++		data->session_generation++;
+ 	memset(r1_amp_status_ptr(data), 0, R1_AMP_STATE_SIZE);
+ 	mailmsg_linux_shared_ptr(data)->magic = MAILMSG_PROTOCOL_MAGIC;
+ 	mailmsg_linux_shared_ptr(data)->version = MAILMSG_PROTOCOL_VERSION;
++	mailmsg_linux_shared_ptr(data)->generation = data->session_generation;
+ 	__flush_dcache_area(r1_amp_status_ptr(data), R1_AMP_STATE_SIZE);
+ 	dsb(sy);
+ 	ret = mailmsg_endpoint_bind(&data->mailmsg_endpoint,
+@@ -1221,13 +1693,28 @@ static ssize_t start_store(struct device *dev,
+ 		goto out;
+ 	}
+ 
++	data->peer_generation = 0;
++	data->session_result = -EINPROGRESS;
++	data->stop_request_sequence = 0;
++	data->stop_reply_type = 0;
++	data->stop_result = -EAGAIN;
++	data->stop_notify_result = -EAGAIN;
++	data->mailmsg_state = R1_AMP_MAILMSG_STARTING;
++	data->lifecycle_notify_bypass = false;
++	data->affinity_seen_on = false;
+ 	data->cpu_on_attempted = true;
+ 	data->cpu_on_ret = psci_ops.cpu_on(data->mpidr, data->entry);
+-	data->mailmsg_state = data->cpu_on_ret ? R1_AMP_MAILMSG_UNARMED :
+-		R1_AMP_MAILMSG_ACTIVE;
+-	if (!data->cpu_on_ret)
++	if (data->cpu_on_ret) {
++		data->mailmsg_state = R1_AMP_MAILMSG_UNARMED;
++		data->session_result = data->cpu_on_ret;
++	} else {
++		data->lifecycle_deadline = jiffies +
++			msecs_to_jiffies(R1_AMP_LIFECYCLE_TIMEOUT_MS);
+ 		mod_delayed_work(system_wq, &data->affinity_work,
+ 				 msecs_to_jiffies(R1_AMP_AFFINITY_MONITOR_MS));
++		mod_delayed_work(system_wq, &data->lifecycle_timeout_work,
++				 msecs_to_jiffies(R1_AMP_LIFECYCLE_TIMEOUT_MS));
++	}
+ 	ret = data->cpu_on_ret;
+ 	out:
+ 	mutex_unlock(&data->lock);
+@@ -1277,12 +1764,22 @@ static ssize_t rearm_store(struct device *dev,
+ 	}
+ 
+ 	memset(&data->mailmsg_endpoint, 0, sizeof(data->mailmsg_endpoint));
++	cancel_delayed_work(&data->lifecycle_timeout_work);
+ 	data->image_written = 0;
+ 	data->cpu_on_attempted = false;
+ 	data->cpu_on_ret = -EAGAIN;
++	data->affinity_seen_on = false;
+ 	data->mailmsg_state = R1_AMP_MAILMSG_UNARMED;
++	data->peer_generation = 0;
++	data->session_result = -EAGAIN;
+ 	data->next_sequence = 0;
+ 	data->mailmsg_last_notify_result = -EAGAIN;
++	data->stop_request_sequence = 0;
++	data->stop_reply_type = 0;
++	data->stop_result = -EAGAIN;
++	data->stop_notify_result = -EAGAIN;
++	data->notify_inject_remaining = 0;
++	data->lifecycle_notify_bypass = false;
+ out:
+ 	mutex_unlock(&data->lock);
+ 
+@@ -1396,10 +1893,17 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	data->status_offset = status_offset;
+ 	data->cpu_on_ret = -EAGAIN;
+ 	data->mailmsg_state = R1_AMP_MAILMSG_UNARMED;
++	data->session_result = -EAGAIN;
++	data->stop_result = -EAGAIN;
++	data->stop_notify_result = -EAGAIN;
++	data->notify_inject_errno = -EIO;
+ 	data->mailmsg_notify_endpoint.ops = &mailmsg_linux_notify_ops;
+ 	data->mailmsg_notify_endpoint.context = data;
+ 	mutex_init(&data->lock);
+ 	INIT_DELAYED_WORK(&data->affinity_work, r1_amp_affinity_work);
++	INIT_WORK(&data->control_work, r1_amp_mailmsg_control_work);
++	INIT_DELAYED_WORK(&data->lifecycle_timeout_work,
++			  r1_amp_mailmsg_lifecycle_timeout_work);
+ 	atomic_set(&data->mailmsg_user_open_count, 0);
+ 	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
+ 		data->mailmsg_user[priority].parent = data;
+@@ -1428,9 +1932,12 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	ret = device_create_file(dev, &dev_attr_status);
+ 	if (ret)
+ 		goto err_image;
+-	ret = device_create_file(dev, &dev_attr_affinity_state);
++	ret = device_create_file(dev, &dev_attr_mailmsg_stats);
+ 	if (ret)
+ 		goto err_status;
++	ret = device_create_file(dev, &dev_attr_affinity_state);
++	if (ret)
++		goto err_mailmsg_stats;
+ 	ret = device_create_file(dev, &dev_attr_start);
+ 	if (ret)
+ 		goto err_affinity_state;
+@@ -1449,12 +1956,18 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	ret = device_create_file(dev, &dev_attr_mailmsg_ping);
+ 	if (ret)
+ 		goto err_doorbell;
+-	ret = device_create_file(dev, &dev_attr_mailmsg_crc_inject);
++	ret = device_create_file(dev, &dev_attr_mailmsg_stop);
+ 	if (ret)
+ 		goto err_mailmsg_ping;
+-	ret = device_create_file(dev, &dev_attr_mailmsg_queue_push);
++	ret = device_create_file(dev, &dev_attr_mailmsg_crc_inject);
++	if (ret)
++		goto err_mailmsg_stop;
++	ret = device_create_file(dev, &dev_attr_mailmsg_notify_inject);
+ 	if (ret)
+ 		goto err_mailmsg_crc_inject;
++	ret = device_create_file(dev, &dev_attr_mailmsg_queue_push);
++	if (ret)
++		goto err_mailmsg_notify_inject;
+ 	ret = device_create_file(dev, &dev_attr_mailmsg_response);
+ 	if (ret)
+ 		goto err_mailmsg_queue_push;
+@@ -1470,8 +1983,12 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	device_remove_file(dev, &dev_attr_mailmsg_response);
+ err_mailmsg_queue_push:
+ 	device_remove_file(dev, &dev_attr_mailmsg_queue_push);
++err_mailmsg_notify_inject:
++	device_remove_file(dev, &dev_attr_mailmsg_notify_inject);
+ err_mailmsg_crc_inject:
+ 	device_remove_file(dev, &dev_attr_mailmsg_crc_inject);
++err_mailmsg_stop:
++	device_remove_file(dev, &dev_attr_mailmsg_stop);
+ err_mailmsg_ping:
+ 	device_remove_file(dev, &dev_attr_mailmsg_ping);
+ err_doorbell:
+@@ -1486,6 +2003,8 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	device_remove_file(dev, &dev_attr_start);
+ err_affinity_state:
+ 	device_remove_file(dev, &dev_attr_affinity_state);
++err_mailmsg_stats:
++	device_remove_file(dev, &dev_attr_mailmsg_stats);
+ err_status:
+ 	device_remove_file(dev, &dev_attr_status);
+ err_image:
+@@ -1508,10 +2027,14 @@ static int r1_amp_cpu_on_remove(struct platform_device *pdev)
+ 	data->mailmsg_user_removing = true;
+ 	mutex_unlock(&data->lock);
+ 	cancel_delayed_work_sync(&data->affinity_work);
++	cancel_delayed_work_sync(&data->lifecycle_timeout_work);
++	cancel_work_sync(&data->control_work);
+ 	r1_amp_unregister_mailmsg_user(data);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_response);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_queue_push);
++	device_remove_file(&pdev->dev, &dev_attr_mailmsg_notify_inject);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_crc_inject);
++	device_remove_file(&pdev->dev, &dev_attr_mailmsg_stop);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_ping);
+ 	device_remove_file(&pdev->dev, &dev_attr_doorbell);
+ 	device_remove_file(&pdev->dev, &dev_attr_response);
+@@ -1519,6 +2042,7 @@ static int r1_amp_cpu_on_remove(struct platform_device *pdev)
+ 	device_remove_file(&pdev->dev, &dev_attr_rearm);
+ 	device_remove_file(&pdev->dev, &dev_attr_start);
+ 	device_remove_file(&pdev->dev, &dev_attr_affinity_state);
++	device_remove_file(&pdev->dev, &dev_attr_mailmsg_stats);
+ 	device_remove_file(&pdev->dev, &dev_attr_status);
+ 	sysfs_remove_bin_file(&pdev->dev.kobj, &data->image_attr);
+ 	r1_amp_free_mbox_channels(data);
+-- 
+2.55.0
+

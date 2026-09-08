@@ -1,0 +1,98 @@
+From 3c3be7c29a6ac2c741fd48c3751a02dbf7c62d67 Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Sat, 29 Aug 2026 21:08:14 +0800
+Subject: [PATCH 05/12] soc: rockchip: report MailMsg reverse queue-full
+
+---
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 36 ++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index 8f519c640..20c1f54d1 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -40,7 +40,8 @@
+ #define R1_AMP_RSP_PAYLOAD_OFF	0xc0
+ #define R1_AMP_RSP_COMMIT_OFF	0x100
+ #define R1_AMP_MBOX_OBS_OFF	0x140
+-#define R1_AMP_PROTOCOL_SIZE	0x180
++#define R1_AMP_MAILMSG_TX_FULL_OBS_OFF	0x180
++#define R1_AMP_PROTOCOL_SIZE	0x1c0
+ #define R1_AMP_MAILMSG_OFF	0x200
+ #define R1_AMP_STATE_SIZE	(R1_AMP_MAILMSG_OFF + sizeof(struct mailmsg_shared))
+ #define R1_AMP_CMD_PING		1
+@@ -103,6 +104,8 @@ static_assert(sizeof(struct r1_amp_payload_line) == R1_AMP_CACHE_LINE_SIZE);
+ static_assert(sizeof(struct r1_amp_commit_line) == R1_AMP_CACHE_LINE_SIZE);
+ static_assert(sizeof(struct r1_amp_mbox_observation_line) ==
+ 	      R1_AMP_CACHE_LINE_SIZE);
++static_assert(sizeof(struct mailmsg_tx_full_observation) ==
++	      R1_AMP_CACHE_LINE_SIZE);
+ 
+ struct r1_amp_cpu_on_data {
+ 	struct mutex lock;
+@@ -175,6 +178,12 @@ r1_amp_mbox_observation_ptr(struct r1_amp_cpu_on_data *data)
+ 	return r1_amp_protocol_ptr(data, R1_AMP_MBOX_OBS_OFF);
+ }
+ 
++static struct mailmsg_tx_full_observation *
++r1_amp_mailmsg_tx_full_observation_ptr(struct r1_amp_cpu_on_data *data)
++{
++	return r1_amp_protocol_ptr(data, R1_AMP_MAILMSG_TX_FULL_OBS_OFF);
++}
++
+ static struct mailmsg_shared *mailmsg_linux_shared_ptr(struct r1_amp_cpu_on_data *data)
+ {
+ 	return r1_amp_protocol_ptr(data, R1_AMP_MAILMSG_OFF);
+@@ -316,8 +325,13 @@ static ssize_t status_show(struct device *dev,
+ {
+ 	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
+ 	struct r1_amp_mbox_observation_line *observation;
++	struct mailmsg_tx_full_observation *tx_full_observation;
+ 	u64 magic, current_el;
+ 	u32 observation_magic, observation_status, observation_cmd, observation_data;
++	u32 tx_full_commit_first, tx_full_commit_second, tx_full_commit_inv;
++	u32 tx_full_magic, tx_full_count, tx_full_priority, tx_full_type;
++	mailmsg_s32 tx_full_result;
++	bool tx_full_valid;
+ 	u32 a2b_now_status[R1_AMP_MBOX_CONTROLLERS];
+ 	struct r1_amp_mbox_channel *ch;
+ 	int controller, channel;
+@@ -333,6 +347,23 @@ static ssize_t status_show(struct device *dev,
+ 	observation_status = READ_ONCE(observation->a2b_status);
+ 	observation_cmd = READ_ONCE(observation->command);
+ 	observation_data = READ_ONCE(observation->data);
++	tx_full_observation = r1_amp_mailmsg_tx_full_observation_ptr(data);
++	__inval_dcache_area(tx_full_observation, sizeof(*tx_full_observation));
++	dsb(sy);
++	tx_full_commit_first = READ_ONCE(tx_full_observation->commit);
++	tx_full_magic = READ_ONCE(tx_full_observation->magic);
++	tx_full_count = READ_ONCE(tx_full_observation->full_count);
++	tx_full_priority = READ_ONCE(tx_full_observation->last_priority);
++	tx_full_type = READ_ONCE(tx_full_observation->last_type);
++	tx_full_result = READ_ONCE(tx_full_observation->last_result);
++	__inval_dcache_area(tx_full_observation, sizeof(*tx_full_observation));
++	dsb(sy);
++	tx_full_commit_second = READ_ONCE(tx_full_observation->commit);
++	tx_full_commit_inv = READ_ONCE(tx_full_observation->commit_inv);
++	tx_full_valid = tx_full_magic == MAILMSG_TX_FULL_OBSERVATION_MAGIC &&
++		tx_full_commit_first &&
++		tx_full_commit_first == tx_full_commit_second &&
++		tx_full_commit_inv == ~tx_full_commit_second;
+ 	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++)
+ 		a2b_now_status[controller] =
+ 			readl_relaxed(data->mbox_regs[controller] +
+@@ -362,8 +393,11 @@ static ssize_t status_show(struct device *dev,
+ 	}
+ 	ret += sysfs_emit_at(buf, ret,
+ 		"a2b_now=m0:%#x mailmsg_notify=%d "
++		"mailmsg_tx_full=valid:%u/commit:%u/count:%u/priority:%u/type:%u/result:%d "
+ 		"mbox_observation=%#x/%#x/%#x/%#x magic=%#llx current_el=%llu\n",
+ 		a2b_now_status[0], data->mailmsg_last_notify_result,
++		tx_full_valid, tx_full_commit_second, tx_full_count,
++		tx_full_priority, tx_full_type, tx_full_result,
+ 		observation_magic, observation_status,
+ 		observation_cmd, observation_data, magic, current_el);
+ 	mutex_unlock(&data->lock);
+-- 
+2.55.0
+

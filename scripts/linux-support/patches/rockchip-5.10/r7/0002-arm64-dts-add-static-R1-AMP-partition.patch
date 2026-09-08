@@ -1,0 +1,113 @@
+From a3768cbe6ff8112ed38d68acc29cdff2de73fe00 Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Thu, 20 Aug 2026 20:24:28 +0800
+Subject: [PATCH 02/12] arm64: dts: add static R1 AMP partition
+
+---
+ arch/arm64/boot/dts/rockchip/Makefile         |  1 +
+ .../boot/dts/rockchip/rk3588s-yyt-amp.dts     | 80 +++++++++++++++++++
+ 2 files changed, 81 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
+
+diff --git a/arch/arm64/boot/dts/rockchip/Makefile b/arch/arm64/boot/dts/rockchip/Makefile
+index b31316517..4ffd01c97 100644
+--- a/arch/arm64/boot/dts/rockchip/Makefile
++++ b/arch/arm64/boot/dts/rockchip/Makefile
+@@ -292,6 +292,7 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb3-lp4x-v10-sii9022-bt1120-to-hdmi.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb4-lp4x-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb4-lp4x-v10-linux.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-amp.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb8-lp4x-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-tablet-rk806-single-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-tablet-v10.dtb
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
+new file mode 100644
+index 000000000..1e75a85f4
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (c) 2021 Rockchip Electronics Co., Ltd.
++ *
++ */
++
++/dts-v1/;
++
++#include "rk3588s-evb4-lp4x-yyt.dtsi"
++#include "rk3588-linux.dtsi"
++
++/ {
++	model = "Rockchip RK3588S EVB4 LP4X V10 Board";
++	compatible = "rockchip,rk3588s-evb4-lp4x-v10", "rockchip,rk3588";
++};
++
++/*
++ * Headless RKNPU candidate: the vendor R1 HDMI node exposes one MMIO
++ * resource, while the newer Rockchip HDMI driver dereferences a second
++ * resource when HDCP14 is present. Keep this candidate headless so the
++ * unrelated HDMI component cannot block NPU bring-up.
++ */
++&hdmi0 {
++	status = "disabled";
++};
++
++&hdptxphy_hdmi0 {
++	status = "disabled";
++};
++
++&hdmi0_in_vp1 {
++	status = "disabled";
++};
++
++&hdmi0_sound {
++	status = "disabled";
++};
++
++/*
++ * The Rockchip DRM master binds every registered display component, including
++ * HDMI despite its disabled node above.  Remove the master's compatible
++ * match for this NPU-only candidate; RKNPU has its own DRM driver.
++ */
++&display_subsystem {
++	/delete-property/ compatible;
++	status = "disabled";
++};
++
++/*
++* AMP static-check variant:
++* Linux must neither enumerate cpu_l3 nor allocate Zephyr's image region.
++* This does not start Zephyr or configure the firmware CPU hand-off.
++*/
++/ {
++cpus {
++	cpu-map {
++		cluster0 {
++			/delete-node/ core3;
++		};
++	};
++};
++
++reserved-memory {
++	#address-cells = <2>;
++	#size-cells = <2>;
++	ranges;
++
++	zephyr_reserved: zephyr@50000000 {
++		reg = <0x0 0x50000000 0x0 0x00100000>;
++		no-map;
++	};
++};
++};
++
++&arm_pmu {
++interrupt-affinity = <&cpu_l0>, <&cpu_l1>, <&cpu_l2>,
++			<&cpu_b0>, <&cpu_b1>, <&cpu_b2>, <&cpu_b3>;
++};
++
++/delete-node/ &cpu_l3;
+\ No newline at end of file
+-- 
+2.55.0
+

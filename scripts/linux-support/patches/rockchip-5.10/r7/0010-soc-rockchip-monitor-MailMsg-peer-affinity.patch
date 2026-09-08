@@ -1,0 +1,185 @@
+From 178a6e6fa099cc3109972f567413e524f1825f5d Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Sun, 30 Aug 2026 10:44:04 +0800
+Subject: [PATCH 10/12] soc: rockchip: monitor MailMsg peer affinity
+
+---
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 72 ++++++++++++++++---
+ 1 file changed, 62 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index d983cf7dc..4582f3ff0 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -30,6 +30,7 @@
+ #include <linux/sysfs.h>
+ #include <linux/uaccess.h>
+ #include <linux/wait.h>
++#include <linux/workqueue.h>
+ 
+ #include <soc/rockchip/rockchip-mailbox.h>
+ 
+@@ -61,6 +62,7 @@
+ #define R1_AMP_MBOX_CHANNELS_PER_CONTROLLER	4
+ #define R1_AMP_MBOX_CHANNELS	(R1_AMP_MBOX_CONTROLLERS * \
+ 				 R1_AMP_MBOX_CHANNELS_PER_CONTROLLER)
++#define R1_AMP_AFFINITY_MONITOR_MS	1000
+ 
+ struct r1_amp_cpu_on_data;
+ 
+@@ -157,6 +159,9 @@ struct r1_amp_cpu_on_data {
+ 	bool affinity_queried;
+ 	bool cpu_on_attempted;
+ 	enum r1_amp_mailmsg_session_state mailmsg_state;
++	struct delayed_work affinity_work;
++	u32 affinity_monitor_count;
++	u32 affinity_monitor_error_count;
+ 	u64 next_sequence;
+ 	int mailmsg_last_notify_result;
+ 	struct mailmsg_endpoint mailmsg_endpoint;
+@@ -229,6 +234,44 @@ static void r1_amp_mailmsg_mark_offline_locked(struct r1_amp_cpu_on_data *data)
+ 	}
+ }
+ 
++/* Caller holds data->lock. */
++static int r1_amp_refresh_affinity_locked(struct r1_amp_cpu_on_data *data)
++{
++	int state;
++
++	state = psci_ops.affinity_info(data->mpidr, 0);
++	data->affinity_state = state;
++	data->affinity_queried = true;
++	if (!data->cpu_on_ret && state == PSCI_0_2_AFFINITY_LEVEL_OFF)
++		r1_amp_mailmsg_mark_offline_locked(data);
++
++	return state;
++}
++
++static void r1_amp_affinity_work(struct work_struct *work)
++{
++	struct r1_amp_cpu_on_data *data =
++		container_of(to_delayed_work(work), struct r1_amp_cpu_on_data,
++			     affinity_work);
++	int state;
++
++	mutex_lock(&data->lock);
++	if (data->mailmsg_state != R1_AMP_MAILMSG_ACTIVE ||
++	    data->mailmsg_user_removing)
++		goto out;
++
++	data->affinity_monitor_count++;
++	state = r1_amp_refresh_affinity_locked(data);
++	if (state < 0)
++		data->affinity_monitor_error_count++;
++	if (data->mailmsg_state == R1_AMP_MAILMSG_ACTIVE &&
++	    !data->mailmsg_user_removing)
++		mod_delayed_work(system_wq, &data->affinity_work,
++				 msecs_to_jiffies(R1_AMP_AFFINITY_MONITOR_MS));
++out:
++	mutex_unlock(&data->lock);
++}
++
+ static void *r1_amp_status_ptr(struct r1_amp_cpu_on_data *data)
+ {
+ 	return data->carveout + data->status_offset;
+@@ -361,6 +404,10 @@ static ssize_t image_write(struct file *filp, struct kobject *kobj,
+ 	ssize_t ret = count;
+ 
+ 	mutex_lock(&data->lock);
++	if (data->mailmsg_user_removing) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	if (data->cpu_on_attempted) {
+ 		ret = -EBUSY;
+ 		goto out;
+@@ -438,10 +485,11 @@ static ssize_t status_show(struct device *dev,
+ 				      R1_AMP_MBOX_A2B_STATUS);
+ 	ch = data->mbox;
+ 	ret = sysfs_emit(buf,
+-		"image=%zu/%u affinity=%s (%d) mailmsg_state=%s cpu_on_attempted=%u cpu_on_ret=%d ",
++		"image=%zu/%u affinity=%s (%d) mailmsg_state=%s affinity_monitor=%u/%u cpu_on_attempted=%u cpu_on_ret=%d ",
+ 		data->image_written, data->image_size,
+ 		data->affinity_queried ? r1_amp_psci_state_name(data->affinity_state) : "not-queried",
+ 		data->affinity_state, r1_amp_mailmsg_state_name(data->mailmsg_state),
++		data->affinity_monitor_count, data->affinity_monitor_error_count,
+ 		data->cpu_on_attempted, data->cpu_on_ret);
+ 	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++) {
+ 		for (channel = 0; channel < R1_AMP_MBOX_CHANNELS_PER_CONTROLLER;
+@@ -486,11 +534,7 @@ static ssize_t affinity_state_show(struct device *dev,
+ 		return -EOPNOTSUPP;
+ 
+ 	mutex_lock(&data->lock);
+-	state = psci_ops.affinity_info(data->mpidr, 0);
+-	data->affinity_state = state;
+-	data->affinity_queried = true;
+-	if (!data->cpu_on_ret && state == PSCI_0_2_AFFINITY_LEVEL_OFF)
+-		r1_amp_mailmsg_mark_offline_locked(data);
++	state = r1_amp_refresh_affinity_locked(data);
+ 	mutex_unlock(&data->lock);
+ 
+ 	return sysfs_emit(buf, "mpidr=%#llx level=0 state=%s (%d)\n",
+@@ -1137,6 +1181,10 @@ static ssize_t start_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&data->lock);
++	if (data->mailmsg_user_removing) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	if (data->cpu_on_attempted) {
+ 		ret = -EALREADY;
+ 		goto out;
+@@ -1150,8 +1198,7 @@ static ssize_t start_store(struct device *dev,
+ 		goto out;
+ 	}
+ 
+-	data->affinity_state = psci_ops.affinity_info(data->mpidr, 0);
+-	data->affinity_queried = true;
++	r1_amp_refresh_affinity_locked(data);
+ 	if (data->affinity_state != PSCI_0_2_AFFINITY_LEVEL_OFF) {
+ 		ret = -EBUSY;
+ 		goto out;
+@@ -1178,6 +1225,9 @@ static ssize_t start_store(struct device *dev,
+ 	data->cpu_on_ret = psci_ops.cpu_on(data->mpidr, data->entry);
+ 	data->mailmsg_state = data->cpu_on_ret ? R1_AMP_MAILMSG_UNARMED :
+ 		R1_AMP_MAILMSG_ACTIVE;
++	if (!data->cpu_on_ret)
++		mod_delayed_work(system_wq, &data->affinity_work,
++				 msecs_to_jiffies(R1_AMP_AFFINITY_MONITOR_MS));
+ 	ret = data->cpu_on_ret;
+ 	out:
+ 	mutex_unlock(&data->lock);
+@@ -1213,8 +1263,7 @@ static ssize_t rearm_store(struct device *dev,
+ 		goto out;
+ 	}
+ 
+-	data->affinity_state = psci_ops.affinity_info(data->mpidr, 0);
+-	data->affinity_queried = true;
++	r1_amp_refresh_affinity_locked(data);
+ 	if (data->affinity_state != PSCI_0_2_AFFINITY_LEVEL_OFF) {
+ 		ret = -EBUSY;
+ 		goto out;
+@@ -1346,9 +1395,11 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	data->image_size = image_size;
+ 	data->status_offset = status_offset;
+ 	data->cpu_on_ret = -EAGAIN;
++	data->mailmsg_state = R1_AMP_MAILMSG_UNARMED;
+ 	data->mailmsg_notify_endpoint.ops = &mailmsg_linux_notify_ops;
+ 	data->mailmsg_notify_endpoint.context = data;
+ 	mutex_init(&data->lock);
++	INIT_DELAYED_WORK(&data->affinity_work, r1_amp_affinity_work);
+ 	atomic_set(&data->mailmsg_user_open_count, 0);
+ 	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
+ 		data->mailmsg_user[priority].parent = data;
+@@ -1456,6 +1507,7 @@ static int r1_amp_cpu_on_remove(struct platform_device *pdev)
+ 	}
+ 	data->mailmsg_user_removing = true;
+ 	mutex_unlock(&data->lock);
++	cancel_delayed_work_sync(&data->affinity_work);
+ 	r1_amp_unregister_mailmsg_user(data);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_response);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_queue_push);
+-- 
+2.55.0
+

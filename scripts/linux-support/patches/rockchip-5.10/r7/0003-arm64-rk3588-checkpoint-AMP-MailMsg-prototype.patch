@@ -1,0 +1,1402 @@
+From 71c2a4a0a20838368bd20003452f321a77743bca Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Thu, 27 Aug 2026 22:04:12 +0800
+Subject: [PATCH 03/12] arm64: rk3588: checkpoint AMP MailMsg prototype
+
+---
+ arch/arm64/boot/dts/rockchip/Makefile         |   6 +
+ .../dts/rockchip/rk3588s-yyt-amp-hotplug.dts  |  52 ++
+ .../rockchip/rk3588s-yyt-amp-mailbox-all.dts  |  39 +
+ .../rk3588s-yyt-amp-mbox0-route-probe.dts     |  29 +
+ .../boot/dts/rockchip/rk3588s-yyt-amp.dts     |  46 +-
+ .../rk3588s-yyt-mailbox-all-probe.dts         |  24 +
+ .../rockchip/rk3588s-yyt-mailbox1-probe.dts   |  17 +
+ .../rk3588s-yyt-mailbox2-npu-probe.dts        |  16 +
+ arch/arm64/configs/rk3588_linux.config        |   4 +-
+ drivers/mailbox/rockchip-mailbox.c            |   5 +
+ drivers/soc/rockchip/Kconfig                  |  18 +
+ drivers/soc/rockchip/Makefile                 |   2 +
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 874 ++++++++++++++++++
+ drivers/soc/rockchip/r1_amp_psci_probe.c      | 116 +++
+ 14 files changed, 1246 insertions(+), 2 deletions(-)
+ create mode 100644 arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-hotplug.dts
+ create mode 100644 arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mailbox-all.dts
+ create mode 100644 arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mbox0-route-probe.dts
+ create mode 100644 arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox-all-probe.dts
+ create mode 100644 arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox1-probe.dts
+ create mode 100644 arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox2-npu-probe.dts
+ create mode 100644 drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+ create mode 100644 drivers/soc/rockchip/r1_amp_psci_probe.c
+
+diff --git a/arch/arm64/boot/dts/rockchip/Makefile b/arch/arm64/boot/dts/rockchip/Makefile
+index 4ffd01c97..1f719ee6d 100644
+--- a/arch/arm64/boot/dts/rockchip/Makefile
++++ b/arch/arm64/boot/dts/rockchip/Makefile
+@@ -293,6 +293,12 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb4-lp4x-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb4-lp4x-v10-linux.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-amp.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-amp-hotplug.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-mailbox1-probe.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-mailbox2-npu-probe.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-mailbox-all-probe.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-amp-mailbox-all.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-yyt-amp-mbox0-route-probe.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb8-lp4x-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-tablet-rk806-single-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-tablet-v10.dtb
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-hotplug.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-hotplug.dts
+new file mode 100644
+index 000000000..14a027df8
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-hotplug.dts
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (c) 2021 Rockchip Electronics Co., Ltd.
++ */
++
++/dts-v1/;
++
++#include "rk3588s-evb4-lp4x-yyt.dtsi"
++#include "rk3588-linux.dtsi"
++
++/ {
++	model = "Rockchip RK3588S EVB4 LP4X V10 Board";
++	compatible = "rockchip,rk3588s-evb4-lp4x-v10", "rockchip,rk3588";
++
++	/*
++	 * Preserve all CPU nodes so the A76 cluster keeps Linux logical IDs 4-7,
++	 * which the current RKLLM runtime expects. CPU3 will be offlined only
++	 * as a reversible runtime hand-off experiment.
++	 */
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		zephyr_reserved: zephyr@50000000 {
++			reg = <0x0 0x50000000 0x0 0x00100000>;
++			no-map;
++		};
++	};
++};
++
++/* Keep the NPU-only RAM candidate headless. */
++&hdmi0 {
++	status = "disabled";
++};
++
++&hdptxphy_hdmi0 {
++	status = "disabled";
++};
++
++&hdmi0_in_vp1 {
++	status = "disabled";
++};
++
++&hdmi0_sound {
++	status = "disabled";
++};
++
++&display_subsystem {
++	/delete-property/ compatible;
++	status = "disabled";
++};
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mailbox-all.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mailbox-all.dts
+new file mode 100644
+index 000000000..b2fd6a584
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mailbox-all.dts
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * RAM-only all-controller mailbox matrix.
++ *
++ * mailbox0 A2B raw 97..100 is experimentally established.  The mailbox1
++ * and mailbox2 groups below are deliberately labelled candidates: this
++ * image tests them with tagged one-message channels and is not a persistent
++ * platform configuration.
++ */
++
++/dts-v1/;
++
++#include "rk3588s-yyt-amp.dts"
++#include <dt-bindings/soc/rockchip-amp.h>
++
++#define CPU_GET_AFFINITY(cpu, cluster) ((cpu) << 8)
++
++/ {
++	rockchip_amp: rockchip-amp {
++		compatible = "rockchip,amp";
++		amp-irqs = /bits/ 64 <
++			/* mailbox0: established A2B raw 97..100 */
++			GIC_AMP_IRQ_CFG_ROUTE(97, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(98, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(99, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(100, 0xd0, CPU_GET_AFFINITY(3, 0))
++			/* mailbox1: candidate A2B raw 105..108 */
++			GIC_AMP_IRQ_CFG_ROUTE(105, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(106, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(107, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(108, 0xd0, CPU_GET_AFFINITY(3, 0))
++			/* mailbox2: candidate A2B raw 113..116 */
++			GIC_AMP_IRQ_CFG_ROUTE(113, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(114, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(115, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(116, 0xd0, CPU_GET_AFFINITY(3, 0))>;
++		status = "okay";
++	};
++};
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mbox0-route-probe.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mbox0-route-probe.dts
+new file mode 100644
+index 000000000..a2902de4f
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp-mbox0-route-probe.dts
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * RAM-only preflight for the mailbox0 A2B route group.
++ *
++ * The existing AMP tree proves only mailbox0 ch3 -> raw SPI100.  This tree
++ * routes the adjacent candidate group 97..100 to the Linux-excluded CPU3,
++ * but declares no new mailbox client and sends no new message.  It exists
++ * solely to prove that the Rockchip AMP GIC route mechanism is active before
++ * any multi-channel traffic test.
++ */
++
++/dts-v1/;
++
++#include "rk3588s-yyt-amp.dts"
++#include <dt-bindings/soc/rockchip-amp.h>
++
++#define CPU_GET_AFFINITY(cpu, cluster) ((cpu) << 8)
++
++/ {
++	rockchip_amp: rockchip-amp {
++		compatible = "rockchip,amp";
++		amp-irqs = /bits/ 64 <
++			GIC_AMP_IRQ_CFG_ROUTE(97, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(98, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(99, 0xd0, CPU_GET_AFFINITY(3, 0))
++			GIC_AMP_IRQ_CFG_ROUTE(100, 0xd0, CPU_GET_AFFINITY(3, 0))>;
++		status = "okay";
++	};
++};
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
+index 1e75a85f4..efbe5f95b 100644
+--- a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-amp.dts
+@@ -46,12 +46,52 @@ &display_subsystem {
+ 	status = "disabled";
+ };
+ 
++/*
++ * The R1 candidate does not need Mali for NPU or PSCI preflight.  The
++ * vendor GPU driver can stall during asynchronous probe on this board, so
++ * keep it outside this headless RAM-only candidate.
++ */
++&gpu {
++	status = "disabled";
++};
++
+ /*
+ * AMP static-check variant:
+ * Linux must neither enumerate cpu_l3 nor allocate Zephyr's image region.
+ * This does not start Zephyr or configure the firmware CPU hand-off.
+ */
+ / {
++	/*
++	 * Runtime preflight only: this node causes one standard PSCI
++	 * AFFINITY_INFO query for the Linux-excluded A55 core3.  The paired
++	 * driver has no CPU_ON path and never calls Rockchip AMP SiP.
++	 */
++	r1_amp_psci_probe: amp-psci-probe {
++		compatible = "youyeetoo,r1-amp-psci-probe";
++		target-mpidr = /bits/ 64 <0x300>;
++		status = "okay";
++	};
++
++	/*
++	 * This driver only stages a user-supplied heartbeat image at probe.
++	 * A root-only sysfs write of the exact word "start" is required before
++	 * its one permitted standard PSCI CPU_ON call.
++	 */
++	r1_amp_cpu_on_heartbeat: amp-cpu-on-heartbeat {
++		compatible = "youyeetoo,r1-amp-psci-cpu-on-heartbeat";
++		memory-region = <&zephyr_reserved>;
++		/* Each V1 channel is held by one full-duplex Linux mailbox client. */
++		mbox-names = "m0ch0", "m0ch1", "m0ch2", "m0ch3";
++		mboxes = <&mailbox0 0>, <&mailbox0 1>,
++			 <&mailbox0 2>, <&mailbox0 3>;
++		target-mpidr = /bits/ 64 <0x300>;
++		zephyr-entry = /bits/ 64 <0x5000100c>;
++		/* MailMsg V2 Zephyr image: 41,008 B; keep the sysfs loader exact. */
++		zephyr-image-size = <0xa030>;
++		status-offset = <0xff000>;
++		status = "okay";
++	};
++
+ cpus {
+ 	cpu-map {
+ 		cluster0 {
+@@ -77,4 +117,8 @@ &arm_pmu {
+ 			<&cpu_b0>, <&cpu_b1>, <&cpu_b2>, <&cpu_b3>;
+ };
+ 
+-/delete-node/ &cpu_l3;
+\ No newline at end of file
++/delete-node/ &cpu_l3;
++
++&mailbox0 {
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox-all-probe.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox-all-probe.dts
+new file mode 100644
+index 000000000..81ff0fc51
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox-all-probe.dts
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * RAM-only coexistence probe for all three RK3588 mailbox controllers.
++ *
++ * Linux binds mailbox0, mailbox1, and mailbox2, but this tree declares no
++ * mailbox clients and sends no mailbox traffic.  The only functional
++ * regression is a known RKNPU/RKLLM model invocation.
++ */
++
++/dts-v1/;
++
++#include "rk3588s-yyt.dts"
++
++&mailbox0 {
++	status = "okay";
++};
++
++&mailbox1 {
++	status = "okay";
++};
++
++&mailbox2 {
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox1-probe.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox1-probe.dts
+new file mode 100644
+index 000000000..d1ba179e3
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox1-probe.dts
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * RAM-only ownership probe for RK3588 mailbox1.
++ *
++ * This deliberately enables only the Linux mailbox controller.  It defines
++ * no mailbox client, does not reserve/boot a Zephyr CPU, and does not send a
++ * message.  It is for observing whether the normal Linux clock-enable and
++ * controller-probe path can access the MCU_DDR-labelled peripheral.
++ */
++
++/dts-v1/;
++
++#include "rk3588s-yyt.dts"
++
++&mailbox1 {
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox2-npu-probe.dts b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox2-npu-probe.dts
+new file mode 100644
+index 000000000..0aaa4df38
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-yyt-mailbox2-npu-probe.dts
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * RAM-only ownership probe for RK3588 mailbox2 (MCU_NPU-labelled).
++ *
++ * Only the Linux controller is enabled.  No mailbox client is declared and
++ * no message is sent.  The runtime regression is a known RKNPU/RKLLM model
++ * invocation, so a pass only establishes coexistence for that workload.
++ */
++
++/dts-v1/;
++
++#include "rk3588s-yyt.dts"
++
++&mailbox2 {
++	status = "okay";
++};
+diff --git a/arch/arm64/configs/rk3588_linux.config b/arch/arm64/configs/rk3588_linux.config
+index e2d30904b..1e77ed87f 100644
+--- a/arch/arm64/configs/rk3588_linux.config
++++ b/arch/arm64/configs/rk3588_linux.config
+@@ -1,3 +1,5 @@
+ # CONFIG_BCMDHD_SDIO=y is not set
+ CONFIG_BCMDHD_PCIE=y
+-CONFIG_MALI_CSF_SUPPORT=y
++# CONFIG_MALI_CSF_SUPPORT is not set
++CONFIG_ROCKCHIP_AMP_PSCI_PROBE=y
++CONFIG_ROCKCHIP_AMP_PSCI_CPU_ON_HEARTBEAT=y
+diff --git a/drivers/mailbox/rockchip-mailbox.c b/drivers/mailbox/rockchip-mailbox.c
+index a4bc367be..c20eccba0 100644
+--- a/drivers/mailbox/rockchip-mailbox.c
++++ b/drivers/mailbox/rockchip-mailbox.c
+@@ -96,6 +96,11 @@ static int rockchip_mbox_startup(struct mbox_chan *chan)
+ 	struct rockchip_mbox_chan *chans = chan->con_priv;
+ 	u32 val = 0U;
+ 
++	/* A deferred consumer can observe a registered controller before its
++	 * platform private data is available; retry instead of dereferencing it. */
++	if (!mb || !chans)
++		return -EPROBE_DEFER;
++
+ 	/* Enable the corresponding B2A interrupt */
+ 	spin_lock(&mb->cfg_lock);
+ 	val = readl_relaxed(mb->mbox_base + MAILBOX_B2A_INTEN) |
+diff --git a/drivers/soc/rockchip/Kconfig b/drivers/soc/rockchip/Kconfig
+index 32cb2566c..2db49ea9c 100644
+--- a/drivers/soc/rockchip/Kconfig
++++ b/drivers/soc/rockchip/Kconfig
+@@ -36,6 +36,24 @@ config ROCKCHIP_AMP
+ 	  Say y here to enable Rockchip AMP support.
+ 	  This option protects resources used by AMP.
+ 
++config ROCKCHIP_AMP_PSCI_PROBE
++	bool "Rockchip AMP PSCI status probe"
++	depends on ROCKCHIP_AMP && ARM64 && ARM_PSCI_FW
++	help
++	  Build the R1 AMP preflight probe. It only asks PSCI for the power
++	  state of the fixed A55 core whose MPIDR is provided by device tree.
++	  It does not start or stop a CPU, configure Rockchip AMP SiP state,
++	  or map AMP shared memory.
++
++config ROCKCHIP_AMP_PSCI_CPU_ON_HEARTBEAT
++	bool "Rockchip AMP one-shot PSCI CPU_ON heartbeat launcher"
++	depends on ROCKCHIP_AMP_PSCI_PROBE && ARM64 && ARM_PSCI_FW
++	help
++	  Build the R1 AMP CPU_ON smoke-test driver.  It exposes a root-only
++	  binary sysfs image loader and requires an explicit "start" write before
++	  it calls PSCI CPU_ON once.  It only supports the fixed A55 core3 and
++	  the reserved Zephyr heartbeat carveout described by device tree.
++
+ config ROCKCHIP_AMP_RPMSG_SHAREDMEM
+ 	tristate "Rockchip AMP RPMsg Shared Memory"
+ 	depends on ARCH_ROCKCHIP && RPMSG
+diff --git a/drivers/soc/rockchip/Makefile b/drivers/soc/rockchip/Makefile
+index c2ec65ba2..bfd59623b 100644
+--- a/drivers/soc/rockchip/Makefile
++++ b/drivers/soc/rockchip/Makefile
+@@ -3,6 +3,8 @@
+ # Rockchip Soc drivers
+ #
+ obj-$(CONFIG_ROCKCHIP_AMP) += rockchip_amp.o
++obj-$(CONFIG_ROCKCHIP_AMP_PSCI_PROBE) += r1_amp_psci_probe.o
++obj-$(CONFIG_ROCKCHIP_AMP_PSCI_CPU_ON_HEARTBEAT) += r1_amp_psci_cpu_on_heartbeat.o
+ obj-$(CONFIG_ROCKCHIP_AMP_RPMSG_SHAREDMEM) += rockchip_amp_rpmsg_sharedmem.o
+ obj-$(CONFIG_ROCKCHIP_AMP_RPMSG_TIMESYNC) += rockchip_amp_rpmsg_timesync.o
+ obj-$(CONFIG_ROCKCHIP_CPUINFO) += rockchip-cpuinfo.o
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+new file mode 100644
+index 000000000..9d8f48b69
+--- /dev/null
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -0,0 +1,874 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * R1 one-shot PSCI CPU_ON heartbeat launcher.
++ *
++ * This is deliberately a smoke-test mechanism, not a general AMP loader.
++ * Users first write the exact Zephyr heartbeat image to the root-only binary
++ * sysfs attribute.  Only a subsequent explicit "start" write may issue one
++ * standard PSCI CPU_ON call for the Linux-excluded A55 core3.
++ */
++
++#include <asm/barrier.h>
++#include <asm/cacheflush.h>
++
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/mailbox_client.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/psci.h>
++#include <linux/slab.h>
++#include <linux/sysfs.h>
++
++#include <soc/rockchip/rockchip-mailbox.h>
++
++#include <uapi/linux/psci.h>
++
++#include "../../../../mailmsg/mailmsg.h"
++
++#define R1_AMP_A55_CORE3_MPIDR	0x300UL
++#define R1_AMP_MAGIC		0x414d5031ULL /* "AMP1" */
++#define R1_AMP_STATUS_WORDS	2
++#define R1_AMP_CACHE_LINE_SIZE	64
++#define R1_AMP_REQ_PAYLOAD_OFF	0x40
++#define R1_AMP_REQ_COMMIT_OFF	0x80
++#define R1_AMP_RSP_PAYLOAD_OFF	0xc0
++#define R1_AMP_RSP_COMMIT_OFF	0x100
++#define R1_AMP_MBOX_OBS_OFF	0x140
++#define R1_AMP_PROTOCOL_SIZE	0x180
++#define R1_AMP_MAILMSG_OFF	0x200
++#define R1_AMP_STATE_SIZE	(R1_AMP_MAILMSG_OFF + sizeof(struct mailmsg_shared))
++#define R1_AMP_CMD_PING		1
++#define R1_AMP_MAILMSG_DOORBELL	0xa2b10000U
++#define R1_AMP_MBOX_A2B_STATUS	0x04
++#define R1_AMP_MBOX_A2B_CMD(ch)	(0x08 + (ch) * 8)
++#define R1_AMP_MBOX_A2B_DAT(ch)	(0x0c + (ch) * 8)
++#define R1_AMP_MBOX_TX_CHANNEL	3
++#define R1_AMP_MBOX_CONTROLLERS	1
++#define R1_AMP_MBOX_CHANNELS_PER_CONTROLLER	4
++#define R1_AMP_MBOX_CHANNELS	(R1_AMP_MBOX_CONTROLLERS * \
++				 R1_AMP_MBOX_CHANNELS_PER_CONTROLLER)
++
++struct r1_amp_cpu_on_data;
++
++/* One Linux mailbox client owns one complete, bidirectional V1 channel. */
++struct r1_amp_mbox_channel {
++	struct mbox_client client;
++	struct mbox_chan *chan;
++	struct rockchip_mbox_msg tx_msg;
++	struct r1_amp_cpu_on_data *parent;
++	u32 index;
++	u32 controller;
++	u32 controller_channel;
++	atomic_t rx_count;
++	u32 rx_last_cmd;
++	u32 rx_last_data;
++	int tx_ret;
++	u32 tx_count;
++};
++
++struct r1_amp_payload_line {
++	u32 command;
++	u32 value;
++	s32 status;
++	u32 result;
++	u8 reserved[R1_AMP_CACHE_LINE_SIZE - 16];
++};
++
++struct r1_amp_commit_line {
++	u64 sequence;
++	u64 sequence_inv;
++	u8 reserved[R1_AMP_CACHE_LINE_SIZE - 16];
++};
++
++/* Written only by Zephyr after it observes one Linux-to-Zephyr A2B event. */
++struct r1_amp_mbox_observation_line {
++	u32 magic;
++	u32 a2b_status;
++	u32 command;
++	u32 data;
++	u8 reserved[R1_AMP_CACHE_LINE_SIZE - 16];
++};
++
++static_assert(sizeof(struct r1_amp_payload_line) == R1_AMP_CACHE_LINE_SIZE);
++static_assert(sizeof(struct r1_amp_commit_line) == R1_AMP_CACHE_LINE_SIZE);
++static_assert(sizeof(struct r1_amp_mbox_observation_line) ==
++	      R1_AMP_CACHE_LINE_SIZE);
++
++struct r1_amp_cpu_on_data {
++	struct mutex lock;
++	struct r1_amp_mbox_channel mbox[R1_AMP_MBOX_CHANNELS];
++	void __iomem *mbox_regs[R1_AMP_MBOX_CONTROLLERS];
++	u32 mbox_a2b_at_tx_status;
++	u32 mbox_a2b_at_tx_cmd;
++	u32 mbox_a2b_at_tx_data;
++	void *carveout;
++	phys_addr_t carveout_phys;
++	resource_size_t carveout_size;
++	u64 mpidr;
++	u64 entry;
++	u32 image_size;
++	u32 status_offset;
++	size_t image_written;
++	int affinity_state;
++	int cpu_on_ret;
++	bool affinity_queried;
++	bool cpu_on_attempted;
++	u64 next_sequence;
++	u32 mailmsg_next_sequence;
++	struct bin_attribute image_attr;
++};
++
++static void r1_amp_mbox_rx_callback(struct mbox_client *client, void *message)
++{
++	struct r1_amp_mbox_channel *channel =
++		container_of(client, struct r1_amp_mbox_channel, client);
++	struct rockchip_mbox_msg *msg = message;
++
++	/* Copy immediately: the mailbox controller owns the message storage. */
++	if (msg) {
++		WRITE_ONCE(channel->rx_last_cmd, msg->cmd);
++		WRITE_ONCE(channel->rx_last_data, msg->data);
++	}
++	atomic_inc(&channel->rx_count);
++}
++
++static const char *r1_amp_psci_state_name(int state)
++{
++	switch (state) {
++	case PSCI_0_2_AFFINITY_LEVEL_ON:
++		return "on";
++	case PSCI_0_2_AFFINITY_LEVEL_OFF:
++		return "off";
++	case PSCI_0_2_AFFINITY_LEVEL_ON_PENDING:
++		return "on-pending";
++	default:
++		return "error";
++	}
++}
++
++static void *r1_amp_status_ptr(struct r1_amp_cpu_on_data *data)
++{
++	return data->carveout + data->status_offset;
++}
++
++static void *r1_amp_protocol_ptr(struct r1_amp_cpu_on_data *data,
++				unsigned int offset)
++{
++	return r1_amp_status_ptr(data) + offset;
++}
++
++static struct r1_amp_mbox_observation_line *
++r1_amp_mbox_observation_ptr(struct r1_amp_cpu_on_data *data)
++{
++	return r1_amp_protocol_ptr(data, R1_AMP_MBOX_OBS_OFF);
++}
++
++static struct mailmsg_shared *mailmsg_linux_shared_ptr(struct r1_amp_cpu_on_data *data)
++{
++	return r1_amp_protocol_ptr(data, R1_AMP_MAILMSG_OFF);
++}
++
++static void mailmsg_linux_publish(const void *addr, mailmsg_u32 len)
++{
++	__flush_dcache_area((void *)addr, len);
++	dsb(sy);
++}
++
++static void mailmsg_linux_acquire(const void *addr, mailmsg_u32 len)
++{
++	__inval_dcache_area((void *)addr, len);
++	dsb(sy);
++}
++
++static u32 mailmsg_payload_u32(const mailmsg_u8 payload[4])
++{
++	return (u32)payload[0] | ((u32)payload[1] << 8) |
++	       ((u32)payload[2] << 16) | ((u32)payload[3] << 24);
++}
++
++static void mailmsg_store_payload_u32(mailmsg_u8 payload[4], u32 value)
++{
++	payload[0] = value;
++	payload[1] = value >> 8;
++	payload[2] = value >> 16;
++	payload[3] = value >> 24;
++}
++
++/* Keep the kernel launcher on the exact MailMsg ABI without coupling it to
++ * a particular notification backend.  These are the same SPSC operations as
++ * src/mailmsg/mailmsg.c, with kernel cache hooks supplied above. */
++static int mailmsg_linux_ring_push(struct mailmsg_ring *ring,
++				   struct mailmsg_message *message)
++{
++	mailmsg_u32 producer = ring->producer;
++	mailmsg_u32 next = (producer + 1U) % MAILMSG_RING_SLOTS;
++	struct mailmsg_message *slot;
++
++	if (!message->sequence || message->length > MAILMSG_PAYLOAD_BYTES)
++		return -EINVAL;
++	mailmsg_linux_acquire(&ring->consumer, sizeof(ring->consumer));
++	if (next == ring->consumer)
++		return -ENOSPC;
++
++	slot = &ring->slot[producer];
++	*slot = *message;
++	slot->commit = 0;
++	slot->crc32 = mailmsg_frame_crc32(slot);
++	mailmsg_linux_publish(slot, sizeof(*slot));
++	slot->commit = message->sequence;
++	mailmsg_linux_publish(&slot->commit, sizeof(slot->commit));
++	ring->producer = next;
++	mailmsg_linux_publish(&ring->producer, sizeof(ring->producer));
++	return 0;
++}
++
++static int mailmsg_linux_ring_pop(struct mailmsg_ring *ring,
++				  struct mailmsg_message *message)
++{
++	mailmsg_u32 consumer = ring->consumer;
++	struct mailmsg_message *slot;
++
++	mailmsg_linux_acquire(&ring->producer, sizeof(ring->producer));
++	if (consumer == ring->producer)
++		return -ENODATA;
++
++	slot = &ring->slot[consumer];
++	mailmsg_linux_acquire(slot, sizeof(*slot));
++	if (slot->commit != slot->sequence)
++		return -EAGAIN;
++	if (!slot->sequence || slot->length > MAILMSG_PAYLOAD_BYTES)
++		return -EPROTO;
++	if (slot->crc32 != mailmsg_frame_crc32(slot))
++		return -EBADMSG;
++	*message = *slot;
++	ring->consumer = (consumer + 1U) % MAILMSG_RING_SLOTS;
++	mailmsg_linux_publish(&ring->consumer, sizeof(ring->consumer));
++	return 0;
++}
++
++static int r1_amp_map_mbox_regs(struct device *dev,
++				 struct r1_amp_cpu_on_data *data)
++{
++	struct device_node *mbox_np;
++	struct resource res;
++	int controller, ret;
++
++	/* Map each distinct controller from the first channel of its DT group. */
++	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++) {
++		mbox_np = of_parse_phandle(dev->of_node, "mboxes",
++			controller * R1_AMP_MBOX_CHANNELS_PER_CONTROLLER);
++		if (!mbox_np)
++			return dev_err_probe(dev, -EINVAL, "missing mailbox%d phandle\n",
++					     controller);
++
++		ret = of_address_to_resource(mbox_np, 0, &res);
++		of_node_put(mbox_np);
++		if (ret)
++			return dev_err_probe(dev, ret, "invalid mailbox%d reg\n", controller);
++
++		data->mbox_regs[controller] =
++			devm_ioremap(dev, res.start, resource_size(&res));
++		if (!data->mbox_regs[controller])
++			return dev_err_probe(dev, -ENOMEM,
++					     "failed to map mailbox%d registers\n", controller);
++	}
++
++	return 0;
++}
++
++static ssize_t image_write(struct file *filp, struct kobject *kobj,
++			   struct bin_attribute *attr, char *buf,
++			   loff_t off, size_t count)
++{
++	struct device *dev = kobj_to_dev(kobj);
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	ssize_t ret = count;
++
++	mutex_lock(&data->lock);
++	if (data->cpu_on_attempted) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (off != data->image_written) {
++		ret = -ESPIPE;
++		goto out;
++	}
++	if (count > data->image_size - data->image_written) {
++		ret = -EFBIG;
++		goto out;
++	}
++
++	memcpy(data->carveout + off, buf, count);
++	data->image_written += count;
++
++	if (data->image_written == data->image_size) {
++		__flush_dcache_area(data->carveout, data->image_size);
++		flush_icache_range((unsigned long)data->carveout,
++				   (unsigned long)data->carveout + data->image_size);
++		dsb(sy);
++	}
++out:
++	mutex_unlock(&data->lock);
++	return ret;
++}
++
++static ssize_t status_show(struct device *dev,
++			   struct device_attribute *attr, char *buf)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	struct r1_amp_mbox_observation_line *observation;
++	u64 magic, current_el;
++	u32 observation_magic, observation_status, observation_cmd, observation_data;
++	u32 a2b_now_status[R1_AMP_MBOX_CONTROLLERS];
++	struct r1_amp_mbox_channel *ch;
++	int controller, channel;
++	ssize_t ret;
++
++	mutex_lock(&data->lock);
++	__inval_dcache_area(r1_amp_status_ptr(data), R1_AMP_CACHE_LINE_SIZE);
++	magic = READ_ONCE(((u64 *)r1_amp_status_ptr(data))[0]);
++	current_el = READ_ONCE(((u64 *)r1_amp_status_ptr(data))[1]);
++	observation = r1_amp_mbox_observation_ptr(data);
++	__inval_dcache_area(observation, sizeof(*observation));
++	observation_magic = READ_ONCE(observation->magic);
++	observation_status = READ_ONCE(observation->a2b_status);
++	observation_cmd = READ_ONCE(observation->command);
++	observation_data = READ_ONCE(observation->data);
++	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++)
++		a2b_now_status[controller] =
++			readl_relaxed(data->mbox_regs[controller] +
++				      R1_AMP_MBOX_A2B_STATUS);
++	ch = data->mbox;
++	ret = sysfs_emit(buf,
++		"image=%zu/%u affinity=%s (%d) cpu_on_attempted=%u cpu_on_ret=%d ",
++		data->image_written, data->image_size,
++		data->affinity_queried ? r1_amp_psci_state_name(data->affinity_state) : "not-queried",
++		data->affinity_state, data->cpu_on_attempted, data->cpu_on_ret);
++	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++) {
++		for (channel = 0; channel < R1_AMP_MBOX_CHANNELS_PER_CONTROLLER;
++		     channel++) {
++			struct r1_amp_mbox_channel *entry =
++				&ch[controller * R1_AMP_MBOX_CHANNELS_PER_CONTROLLER + channel];
++
++			ret += sysfs_emit_at(buf, ret,
++				"m%dc%d=rx:%d/%#x/%#x,tx:%u/%d ",
++				controller, channel, atomic_read(&entry->rx_count),
++				READ_ONCE(entry->rx_last_cmd),
++				READ_ONCE(entry->rx_last_data), entry->tx_count,
++				entry->tx_ret);
++		}
++	}
++	ret += sysfs_emit_at(buf, ret,
++		"a2b_now=m0:%#x "
++		"mbox_observation=%#x/%#x/%#x/%#x magic=%#llx current_el=%llu\n",
++		a2b_now_status[0],
++		observation_magic, observation_status,
++		observation_cmd, observation_data, magic, current_el);
++	mutex_unlock(&data->lock);
++
++	return ret;
++}
++static DEVICE_ATTR_RO(status);
++
++static ssize_t ping_store(struct device *dev, struct device_attribute *attr,
++			  const char *buf, size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	struct r1_amp_payload_line *payload;
++	struct r1_amp_commit_line *commit;
++	struct r1_amp_mbox_observation_line *observation;
++	u32 value;
++	u64 sequence;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &value);
++	if (ret)
++		return ret;
++
++	mutex_lock(&data->lock);
++	if (!data->cpu_on_attempted || data->cpu_on_ret) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	sequence = ++data->next_sequence;
++	if (!sequence)
++		sequence = ++data->next_sequence;
++
++	payload = r1_amp_protocol_ptr(data, R1_AMP_REQ_PAYLOAD_OFF);
++	commit = r1_amp_protocol_ptr(data, R1_AMP_REQ_COMMIT_OFF);
++	memset(payload, 0, sizeof(*payload));
++	WRITE_ONCE(payload->command, R1_AMP_CMD_PING);
++	WRITE_ONCE(payload->value, value);
++	__flush_dcache_area(payload, sizeof(*payload));
++	dsb(sy);
++
++	WRITE_ONCE(commit->sequence, sequence);
++	WRITE_ONCE(commit->sequence_inv, ~sequence);
++	__flush_dcache_area(commit, sizeof(*commit));
++	dsb(sy);
++
++	/* A fresh observation is required for each one-shot TX3 probe. */
++	observation = r1_amp_mbox_observation_ptr(data);
++	memset(observation, 0, sizeof(*observation));
++	__flush_dcache_area(observation, sizeof(*observation));
++	dsb(sy);
++
++	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_msg.cmd = R1_AMP_CMD_PING;
++	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_msg.data = value;
++	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_ret =
++		mbox_send_message(data->mbox[R1_AMP_MBOX_TX_CHANNEL].chan,
++				  &data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_msg);
++	if (data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_ret < 0) {
++		ret = data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_ret;
++		goto out;
++	}
++	data->mbox_a2b_at_tx_status =
++		readl_relaxed(data->mbox_regs[0] + R1_AMP_MBOX_A2B_STATUS);
++	data->mbox_a2b_at_tx_cmd = readl_relaxed(data->mbox_regs[0] +
++				       R1_AMP_MBOX_A2B_CMD(R1_AMP_MBOX_TX_CHANNEL));
++	data->mbox_a2b_at_tx_data = readl_relaxed(data->mbox_regs[0] +
++				        R1_AMP_MBOX_A2B_DAT(R1_AMP_MBOX_TX_CHANNEL));
++	data->mbox[R1_AMP_MBOX_TX_CHANNEL].tx_count++;
++	ret = count;
++out:
++	mutex_unlock(&data->lock);
++	return ret;
++}
++static DEVICE_ATTR_WO(ping);
++
++/*
++ * Matrix preflight doorbell.  Unlike ping, this has no shared-memory
++ * payload: it exercises exactly one requested V1 channel and relies on the
++ * Zephyr ISR to reply on the same-numbered B2A channel.
++ */
++static ssize_t doorbell_store(struct device *dev, struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	struct r1_amp_mbox_channel *channel;
++	u32 index, value;
++	int ret;
++
++	if (sscanf(buf, "%u %u", &index, &value) != 2)
++		return -EINVAL;
++	if (index >= R1_AMP_MBOX_CHANNELS)
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	if (!data->cpu_on_attempted || data->cpu_on_ret) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	channel = &data->mbox[index];
++	channel->tx_msg.cmd = 0xa2b00000U | index;
++	channel->tx_msg.data = value;
++	channel->tx_ret = mbox_send_message(channel->chan, &channel->tx_msg);
++	if (channel->tx_ret < 0) {
++		ret = channel->tx_ret;
++		goto out;
++	}
++	channel->tx_count++;
++	ret = count;
++out:
++	mutex_unlock(&data->lock);
++	return ret;
++}
++static DEVICE_ATTR_WO(doorbell);
++
++/*
++ * MailMsg V1 entry point.  Input is "priority value".  The message is put
++ * into the priority's Linux->CPU3 SPSC ring before its matching doorbell is
++ * sent.  The mailbox carries only a wake-up/priority hint, never payload.
++ */
++static ssize_t mailmsg_ping_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	struct mailmsg_shared *shared;
++	struct mailmsg_message request = { };
++	struct r1_amp_mbox_channel *channel;
++	u32 priority, value;
++	int ret;
++
++	if (sscanf(buf, "%u %u", &priority, &value) != 2 ||
++	    priority >= MAILMSG_PRIORITY_COUNT)
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	if (!data->cpu_on_attempted || data->cpu_on_ret) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	shared = mailmsg_linux_shared_ptr(data);
++	mailmsg_linux_acquire(shared, sizeof(*shared));
++	if (shared->magic != MAILMSG_PROTOCOL_MAGIC ||
++	    shared->version != MAILMSG_PROTOCOL_VERSION) {
++		ret = -EPROTO;
++		goto out;
++	}
++
++	request.type = MAILMSG_MSG_PING;
++	request.sequence = ++data->mailmsg_next_sequence;
++	if (!request.sequence)
++		request.sequence = ++data->mailmsg_next_sequence;
++	request.length = sizeof(value);
++	mailmsg_store_payload_u32(request.payload, value);
++	ret = mailmsg_linux_ring_push(&shared->linux_to_cpu3[priority], &request);
++	if (ret)
++		goto out;
++
++	channel = &data->mbox[priority];
++	channel->tx_msg.cmd = R1_AMP_MAILMSG_DOORBELL | priority;
++	channel->tx_msg.data = priority;
++	channel->tx_ret = mbox_send_message(channel->chan, &channel->tx_msg);
++	if (channel->tx_ret < 0) {
++		ret = channel->tx_ret;
++		goto out;
++	}
++	channel->tx_count++;
++	ret = count;
++out:
++	mutex_unlock(&data->lock);
++	return ret;
++}
++static DEVICE_ATTR_WO(mailmsg_ping);
++
++/* Reading consumes at most one response from each independent priority ring. */
++static ssize_t mailmsg_response_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	struct mailmsg_shared *shared;
++	struct mailmsg_message response;
++	int priority;
++	ssize_t ret = 0;
++
++	mutex_lock(&data->lock);
++	shared = mailmsg_linux_shared_ptr(data);
++	mailmsg_linux_acquire(shared, sizeof(*shared));
++	if (shared->magic != MAILMSG_PROTOCOL_MAGIC ||
++	    shared->version != MAILMSG_PROTOCOL_VERSION) {
++		ret = sysfs_emit(buf, "valid=0 reason=protocol-not-ready\n");
++		goto out;
++	}
++
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		int pop_ret = mailmsg_linux_ring_pop(&shared->cpu3_to_linux[priority],
++						  &response);
++
++		if (pop_ret == -ENODATA)
++			continue;
++		if (pop_ret) {
++			ret += sysfs_emit_at(buf, ret, "priority=%d valid=0 ret=%d\n",
++					     priority, pop_ret);
++			continue;
++		}
++		ret += sysfs_emit_at(buf, ret,
++			"priority=%d valid=1 type=%u sequence=%u value=%u\n",
++			priority, response.type, response.sequence,
++			response.length >= sizeof(u32) ?
++			mailmsg_payload_u32(response.payload) : 0);
++	}
++	if (!ret)
++		ret = sysfs_emit(buf, "valid=0 reason=empty\n");
++out:
++	mutex_unlock(&data->lock);
++	return ret;
++}
++static DEVICE_ATTR_RO(mailmsg_response);
++
++static ssize_t response_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	struct r1_amp_payload_line *payload;
++	struct r1_amp_commit_line *commit;
++	u64 sequence, sequence_inv;
++	u32 command = 0, value = 0, result = 0;
++	s32 status = 0;
++	bool valid;
++	int ret;
++
++	mutex_lock(&data->lock);
++	commit = r1_amp_protocol_ptr(data, R1_AMP_RSP_COMMIT_OFF);
++	__inval_dcache_area(commit, sizeof(*commit));
++	sequence = READ_ONCE(commit->sequence);
++	sequence_inv = READ_ONCE(commit->sequence_inv);
++	valid = sequence && sequence_inv == ~sequence;
++
++	if (valid) {
++		payload = r1_amp_protocol_ptr(data, R1_AMP_RSP_PAYLOAD_OFF);
++		__inval_dcache_area(payload, sizeof(*payload));
++		command = READ_ONCE(payload->command);
++		value = READ_ONCE(payload->value);
++		status = READ_ONCE(payload->status);
++		result = READ_ONCE(payload->result);
++	}
++
++	ret = sysfs_emit(buf,
++		"request_seq=%llu response_seq=%llu valid=%u command=%u value=%u status=%d result=%u\n",
++		data->next_sequence, sequence, valid, command, value, status,
++		result);
++	mutex_unlock(&data->lock);
++	return ret;
++}
++static DEVICE_ATTR_RO(response);
++
++static ssize_t start_store(struct device *dev,
++			   struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	int ret;
++
++	if (!sysfs_streq(buf, "start"))
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	if (data->cpu_on_attempted) {
++		ret = -EALREADY;
++		goto out;
++	}
++	if (data->image_written != data->image_size) {
++		ret = -ENODATA;
++		goto out;
++	}
++	if (!psci_ops.affinity_info || !psci_ops.cpu_on) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	data->affinity_state = psci_ops.affinity_info(data->mpidr, 0);
++	data->affinity_queried = true;
++	if (data->affinity_state != PSCI_0_2_AFFINITY_LEVEL_OFF) {
++		ret = -EBUSY;
++		goto out;
++	}
++
++	/* Legacy heartbeat/ping occupies the first 0x180 bytes.  MailMsg starts
++	 * at 0x200 and is initialized before CPU3 can observe the doorbell. */
++	memset(r1_amp_status_ptr(data), 0, R1_AMP_STATE_SIZE);
++	mailmsg_linux_shared_ptr(data)->magic = MAILMSG_PROTOCOL_MAGIC;
++	mailmsg_linux_shared_ptr(data)->version = MAILMSG_PROTOCOL_VERSION;
++	__flush_dcache_area(r1_amp_status_ptr(data), R1_AMP_STATE_SIZE);
++	dsb(sy);
++
++	data->cpu_on_attempted = true;
++	data->cpu_on_ret = psci_ops.cpu_on(data->mpidr, data->entry);
++	ret = data->cpu_on_ret;
++	out:
++	mutex_unlock(&data->lock);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(start);
++
++static void r1_amp_free_mbox_channels(struct r1_amp_cpu_on_data *data)
++{
++	int i;
++
++	for (i = 0; i < R1_AMP_MBOX_CHANNELS; i++) {
++		if (!IS_ERR_OR_NULL(data->mbox[i].chan)) {
++			mbox_free_channel(data->mbox[i].chan);
++			data->mbox[i].chan = NULL;
++		}
++	}
++}
++
++static int r1_amp_request_mbox_channels(struct device *dev,
++					 struct r1_amp_cpu_on_data *data)
++{
++	static const char * const names[R1_AMP_MBOX_CHANNELS] = {
++		"m0ch0", "m0ch1", "m0ch2", "m0ch3",
++	};
++	int i, ret;
++
++	for (i = 0; i < R1_AMP_MBOX_CHANNELS; i++) {
++		struct r1_amp_mbox_channel *channel = &data->mbox[i];
++
++		channel->parent = data;
++		channel->index = i;
++		channel->controller = i / R1_AMP_MBOX_CHANNELS_PER_CONTROLLER;
++		channel->controller_channel =
++			i % R1_AMP_MBOX_CHANNELS_PER_CONTROLLER;
++		channel->client.dev = dev;
++		/*
++		 * The Rockchip controller exposes A2B_STATUS through last_tx_done().
++		 * Do not claim client-managed ACK completion here: this client does
++		 * not call mbox_client_txdone(), and doing so would leave later
++		 * doorbells queued forever.
++		 */
++		channel->client.knows_txdone = false;
++		channel->client.rx_callback = r1_amp_mbox_rx_callback;
++		atomic_set(&channel->rx_count, 0);
++		channel->tx_ret = -EAGAIN;
++		channel->chan = mbox_request_channel_byname(&channel->client,
++							    names[i]);
++		if (IS_ERR(channel->chan)) {
++			ret = PTR_ERR(channel->chan);
++			channel->chan = NULL;
++			r1_amp_free_mbox_channels(data);
++			return dev_err_probe(dev, ret,
++					     "failed to request %s mailbox channel\n",
++					     names[i]);
++		}
++	}
++
++	return 0;
++}
++
++static int r1_amp_cpu_on_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *memory_np;
++	struct reserved_mem *rmem;
++	struct r1_amp_cpu_on_data *data;
++	u32 image_size, status_offset;
++	u64 entry, mpidr;
++	int ret;
++
++	if (of_property_read_u64(dev->of_node, "target-mpidr", &mpidr) ||
++	    of_property_read_u64(dev->of_node, "zephyr-entry", &entry) ||
++	    of_property_read_u32(dev->of_node, "zephyr-image-size", &image_size) ||
++	    of_property_read_u32(dev->of_node, "status-offset", &status_offset))
++		return dev_err_probe(dev, -EINVAL, "missing launch geometry\n");
++
++	if (mpidr != R1_AMP_A55_CORE3_MPIDR)
++		return dev_err_probe(dev, -EINVAL, "refusing MPIDR %#llx\n", mpidr);
++
++	memory_np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	if (!memory_np)
++		return dev_err_probe(dev, -EINVAL, "missing memory-region\n");
++	rmem = of_reserved_mem_lookup(memory_np);
++	of_node_put(memory_np);
++	if (!rmem)
++		return dev_err_probe(dev, -ENODEV, "reserved memory unavailable\n");
++
++	if (!image_size || image_size > status_offset ||
++	    status_offset > rmem->size - R1_AMP_STATE_SIZE ||
++	    entry < rmem->base || entry >= rmem->base + rmem->size)
++		return dev_err_probe(dev, -EINVAL, "invalid launch geometry\n");
++
++	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	data->carveout = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WB);
++	if (IS_ERR(data->carveout))
++		return dev_err_probe(dev, PTR_ERR(data->carveout),
++				     "failed to map Zephyr carveout\n");
++
++	data->carveout_phys = rmem->base;
++	data->carveout_size = rmem->size;
++	data->mpidr = mpidr;
++	data->entry = entry;
++	data->image_size = image_size;
++	data->status_offset = status_offset;
++	data->cpu_on_ret = -EAGAIN;
++	mutex_init(&data->lock);
++	ret = r1_amp_map_mbox_regs(dev, data);
++	if (ret)
++		return ret;
++	platform_set_drvdata(pdev, data);
++
++	ret = r1_amp_request_mbox_channels(dev, data);
++	if (ret)
++		return ret;
++
++	data->image_attr.attr.name = "image";
++	data->image_attr.attr.mode = 0200;
++	data->image_attr.size = image_size;
++	data->image_attr.write = image_write;
++	ret = sysfs_create_bin_file(&dev->kobj, &data->image_attr);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to create image attribute\n");
++
++	ret = device_create_file(dev, &dev_attr_status);
++	if (ret)
++		goto err_image;
++	ret = device_create_file(dev, &dev_attr_start);
++	if (ret)
++		goto err_status;
++	ret = device_create_file(dev, &dev_attr_ping);
++	if (ret)
++		goto err_start;
++	ret = device_create_file(dev, &dev_attr_response);
++	if (ret)
++		goto err_ping;
++	ret = device_create_file(dev, &dev_attr_doorbell);
++	if (ret)
++		goto err_response;
++	ret = device_create_file(dev, &dev_attr_mailmsg_ping);
++	if (ret)
++		goto err_doorbell;
++	ret = device_create_file(dev, &dev_attr_mailmsg_response);
++	if (ret)
++		goto err_mailmsg_ping;
++
++	dev_info(dev, "armed for MPIDR %#llx entry %#llx image %u bytes\n",
++		 mpidr, entry, image_size);
++	return 0;
++
++
++err_mailmsg_ping:
++	device_remove_file(dev, &dev_attr_mailmsg_ping);
++err_doorbell:
++	device_remove_file(dev, &dev_attr_doorbell);
++err_response:
++	device_remove_file(dev, &dev_attr_response);
++err_ping:
++	device_remove_file(dev, &dev_attr_ping);
++err_start:
++	device_remove_file(dev, &dev_attr_start);
++err_status:
++	device_remove_file(dev, &dev_attr_status);
++err_image:
++	sysfs_remove_bin_file(&dev->kobj, &data->image_attr);
++	r1_amp_free_mbox_channels(data);
++	return ret;
++}
++
++static int r1_amp_cpu_on_remove(struct platform_device *pdev)
++{
++	struct r1_amp_cpu_on_data *data = platform_get_drvdata(pdev);
++
++	device_remove_file(&pdev->dev, &dev_attr_mailmsg_response);
++	device_remove_file(&pdev->dev, &dev_attr_mailmsg_ping);
++	device_remove_file(&pdev->dev, &dev_attr_doorbell);
++	device_remove_file(&pdev->dev, &dev_attr_response);
++	device_remove_file(&pdev->dev, &dev_attr_ping);
++	device_remove_file(&pdev->dev, &dev_attr_start);
++	device_remove_file(&pdev->dev, &dev_attr_status);
++	sysfs_remove_bin_file(&pdev->dev.kobj, &data->image_attr);
++	r1_amp_free_mbox_channels(data);
++
++	return 0;
++}
++
++static const struct of_device_id r1_amp_cpu_on_of_match[] = {
++	{ .compatible = "youyeetoo,r1-amp-psci-cpu-on-heartbeat" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, r1_amp_cpu_on_of_match);
++
++static struct platform_driver r1_amp_cpu_on_driver = {
++	.probe = r1_amp_cpu_on_probe,
++	.remove = r1_amp_cpu_on_remove,
++	.driver = {
++		.name = "r1-amp-psci-cpu-on-heartbeat",
++		.of_match_table = r1_amp_cpu_on_of_match,
++	},
++};
++module_platform_driver(r1_amp_cpu_on_driver);
++
++MODULE_DESCRIPTION("R1 one-shot PSCI CPU_ON Zephyr heartbeat launcher");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/rockchip/r1_amp_psci_probe.c b/drivers/soc/rockchip/r1_amp_psci_probe.c
+new file mode 100644
+index 000000000..44ea815c6
+--- /dev/null
++++ b/drivers/soc/rockchip/r1_amp_psci_probe.c
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * R1 AMP preflight probe.
++ *
++ * This intentionally performs only PSCI_AFFINITY_INFO.  It is the first
++ * runtime check before any future CPU_ON experiment, and must stay free of
++ * Rockchip AMP SiP calls, CPU power-state changes, and shared-memory mapping.
++ */
++
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/psci.h>
++#include <linux/slab.h>
++#include <linux/sysfs.h>
++
++#include <uapi/linux/psci.h>
++
++#define R1_AMP_A55_CORE3_MPIDR	0x300UL
++
++struct r1_amp_psci_probe_data {
++	u64 mpidr;
++	int affinity_state;
++};
++
++static const char *r1_amp_psci_state_name(int state)
++{
++	switch (state) {
++	case PSCI_0_2_AFFINITY_LEVEL_ON:
++		return "on";
++	case PSCI_0_2_AFFINITY_LEVEL_OFF:
++		return "off";
++	case PSCI_0_2_AFFINITY_LEVEL_ON_PENDING:
++		return "on-pending";
++	default:
++		return "error";
++	}
++}
++
++static ssize_t affinity_state_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct r1_amp_psci_probe_data *data = dev_get_drvdata(dev);
++
++	if (!data)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "mpidr=%#llx level=0 state=%s (%d)\n",
++			  data->mpidr, r1_amp_psci_state_name(data->affinity_state),
++			  data->affinity_state);
++}
++static DEVICE_ATTR_RO(affinity_state);
++
++static int r1_amp_psci_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct r1_amp_psci_probe_data *data;
++	u64 mpidr;
++	int ret, state;
++
++	if (of_property_read_u64(dev->of_node, "target-mpidr", &mpidr))
++		return dev_err_probe(dev, -EINVAL, "missing target-mpidr\n");
++
++	if (mpidr != R1_AMP_A55_CORE3_MPIDR)
++		return dev_err_probe(dev, -EINVAL,
++				     "refusing MPIDR %#llx (only %#lx is allowed)\n",
++				     mpidr, R1_AMP_A55_CORE3_MPIDR);
++
++	if (!psci_ops.affinity_info)
++		return dev_err_probe(dev, -EOPNOTSUPP,
++				     "PSCI AFFINITY_INFO is unavailable\n");
++
++	state = psci_ops.affinity_info(mpidr, 0);
++	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	data->mpidr = mpidr;
++	data->affinity_state = state;
++	platform_set_drvdata(pdev, data);
++
++	ret = device_create_file(dev, &dev_attr_affinity_state);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to create affinity_state\n");
++
++	dev_info(dev, "PSCI affinity MPIDR %#llx level 0: %s (%d)\n",
++		 mpidr, r1_amp_psci_state_name(state), state);
++
++	return 0;
++}
++
++static int r1_amp_psci_remove(struct platform_device *pdev)
++{
++	device_remove_file(&pdev->dev, &dev_attr_affinity_state);
++
++	return 0;
++}
++
++static const struct of_device_id r1_amp_psci_probe_of_match[] = {
++	{ .compatible = "youyeetoo,r1-amp-psci-probe" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, r1_amp_psci_probe_of_match);
++
++static struct platform_driver r1_amp_psci_probe_driver = {
++	.probe = r1_amp_psci_probe,
++	.remove = r1_amp_psci_remove,
++	.driver = {
++		.name = "r1-amp-psci-probe",
++		.of_match_table = r1_amp_psci_probe_of_match,
++	},
++};
++module_platform_driver(r1_amp_psci_probe_driver);
++
++MODULE_DESCRIPTION("R1 AMP PSCI affinity preflight probe");
++MODULE_LICENSE("GPL");
+-- 
+2.55.0
+

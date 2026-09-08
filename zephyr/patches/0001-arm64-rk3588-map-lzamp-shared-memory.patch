@@ -1,0 +1,98 @@
+diff --git a/arch/arm64/core/mmu.c b/arch/arm64/core/mmu.c
+index a939717f..60c7842d 100644
+--- a/arch/arm64/core/mmu.c
++++ b/arch/arm64/core/mmu.c
+@@ -976,17 +976,14 @@ static void enable_mmu_el1(struct arm_mmu_ptables *ptables, unsigned int flags)
+ 	write_tcr_el1(get_tcr(1));
+ 	write_ttbr0_el1((uint64_t)ptables->base_xlat_table);
+ 
+-	/* Ensure these changes are seen before MMU is enabled */
+-	barrier_isync_fence_full();
+-
+-	/* Enable the MMU and data cache */
++	/* Enable translation first; LZAMP enables D-cache after private IVAC. */
+ 	val = read_sctlr_el1();
+-	write_sctlr_el1(val | SCTLR_M_BIT | SCTLR_C_BIT);
++	write_sctlr_el1(val | SCTLR_M_BIT);
+ 
+-	/* Ensure the MMU enable takes effect immediately */
++	/* Ensure the MMU enable takes effect immediately. */
+ 	barrier_isync_fence_full();
+ 
+-	MMU_DEBUG("MMU enabled with dcache\n");
++	MMU_DEBUG("MMU enabled\n");
+ }
+ 
+ /* ARM MMU Driver Initial Setup */
+diff --git a/arch/arm64/core/prep_c.c b/arch/arm64/core/prep_c.c
+index 3a0eaac2..18dd4a43 100644
+--- a/arch/arm64/core/prep_c.c
++++ b/arch/arm64/core/prep_c.c
+@@ -24,6 +24,9 @@
+ 
+ __weak void z_arm64_mm_init(bool is_primary_core) { }
+ 
++/* LZAMP CPU3 startup cache boundary. */
++extern void lzamp_invalidate_private_cache(uintptr_t start, uintptr_t end);
++
+ /**
+  *
+  * @brief Prepare to and run C code
+@@ -45,6 +48,13 @@ FUNC_NORETURN void z_prep_c(void)
+ 	z_arm64_safe_exception_stack_init();
+ #endif
+ 	z_arm64_mm_init(true);
++	/* CPU3 initialized its private runtime range with D-cache disabled. */
++	lzamp_invalidate_private_cache((uintptr_t)_image_ram_start,
++					(uintptr_t)_image_ram_end);
++	/* Translation is active; enable D-cache only after the private-range IVAC. */
++	uint64_t sctlr = read_sctlr_el1();
++	write_sctlr_el1(sctlr | SCTLR_C_BIT);
++	barrier_isync_fence_full();
+ 	z_arm64_interrupt_init();
+ 
+ 	z_cstart();
+diff --git a/arch/arm64/core/reset.c b/arch/arm64/core/reset.c
+index c4037771..ffa063f5 100644
+--- a/arch/arm64/core/reset.c
++++ b/arch/arm64/core/reset.c
+@@ -287,9 +287,19 @@ void z_arm64_el1_init(void)
+ #endif
+ 
+ 	reg = read_sctlr_el1();
++	/* LZAMP CPU3 starts through PSCI independently of Linux.  The firmware
++	 * may leave EL1 translation/cache state from an earlier CPU_OFF session.
++	 * This function already has a live stack, so publish it before disabling
++	 * data caching; otherwise the epilogue can reload a stale return address. */
++	if (reg & SCTLR_C_BIT) {
++		arch_dcache_flush_and_invd_all();
++		barrier_isync_fence_full();
++		reg &= ~(SCTLR_C_BIT | SCTLR_M_BIT);
++		write_sctlr_el1(reg);
++		__asm__ volatile("dsb ishst; tlbi vmalle1; dsb ish; isb" : : : "memory");
++	}
+ 	reg |= (SCTLR_EL1_RES1 |	/* RES1 */
+ 		SCTLR_I_BIT |		/* Enable i-cache */
+-		SCTLR_C_BIT |		/* Enable d-cache */
+ 		SCTLR_SA_BIT);		/* Enable SP alignment check */
+ 
+ #ifdef CONFIG_ARM_PAC
+diff --git a/soc/rockchip/rk35/rk3588/mmu_regions.c b/soc/rockchip/rk35/rk3588/mmu_regions.c
+index 7e73e4cc..0766f401 100644
+--- a/soc/rockchip/rk35/rk3588/mmu_regions.c
++++ b/soc/rockchip/rk35/rk3588/mmu_regions.c
+@@ -18,6 +18,14 @@ static const struct arm_mmu_region mmu_regions[] = {
+ 			      DT_REG_SIZE_BY_IDX(DT_NODELABEL(gic), 1),
+ 			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
+ 
++	/* LZAMP control page at the end of the 4 MiB Zephyr allocation. */
++	MMU_REGION_FLAT_ENTRY("LZAMP MailMsg control", 0x503ff000UL, 0x1000UL,
++			      MT_NORMAL | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
++
++	/* P0-P3 shared data buffers and the reserved expansion region. */
++	MMU_REGION_FLAT_ENTRY("LZAMP shared data", 0x50400000UL, 0x01c00000UL,
++			      MT_NORMAL | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
++
+ };
+ 
+ const struct arm_mmu_config mmu_config = {

@@ -1,0 +1,149 @@
+From 36bd5c361d71059952df6b3d9987724926a29cbc Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Sun, 30 Aug 2026 09:52:55 +0800
+Subject: [PATCH 08/12] soc: rockchip: add guarded CPU3 rearm
+
+---
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 91 ++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index a7de639aa..32d57e56f 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -434,6 +434,27 @@ static ssize_t status_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(status);
+ 
++/* Unlike status, this reads PSCI_AFFINITY_INFO for every sysfs read. */
++static ssize_t affinity_state_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	int state;
++
++	if (!psci_ops.affinity_info)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&data->lock);
++	state = psci_ops.affinity_info(data->mpidr, 0);
++	data->affinity_state = state;
++	data->affinity_queried = true;
++	mutex_unlock(&data->lock);
++
++	return sysfs_emit(buf, "mpidr=%#llx level=0 state=%s (%d)\n",
++			  data->mpidr, r1_amp_psci_state_name(state), state);
++}
++static DEVICE_ATTR_RO(affinity_state);
++
+ static ssize_t ping_store(struct device *dev, struct device_attribute *attr,
+ 			  const char *buf, size_t count)
+ {
+@@ -1107,6 +1128,60 @@ static ssize_t start_store(struct device *dev,
+ }
+ static DEVICE_ATTR_WO(start);
+ 
++/* End one stopped CPU3 session so a new image may be loaded.  This is a
++ * destructive session boundary, not a retry: old shared-ring frames are
++ * discarded by the next start() initialization. */
++static ssize_t rearm_store(struct device *dev,
++			   struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	int controller;
++	int ret = 0;
++
++	if (!sysfs_streq(buf, "rearm"))
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	if (!data->cpu_on_attempted) {
++		ret = -EINVAL;
++		goto out;
++	}
++	if (atomic_read(&data->mailmsg_user_open_count)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (!psci_ops.affinity_info) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	data->affinity_state = psci_ops.affinity_info(data->mpidr, 0);
++	data->affinity_queried = true;
++	if (data->affinity_state != PSCI_0_2_AFFINITY_LEVEL_OFF) {
++		ret = -EBUSY;
++		goto out;
++	}
++	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++) {
++		if (readl_relaxed(data->mbox_regs[controller] +
++				  R1_AMP_MBOX_A2B_STATUS)) {
++			ret = -EBUSY;
++			goto out;
++		}
++	}
++
++	memset(&data->mailmsg_endpoint, 0, sizeof(data->mailmsg_endpoint));
++	data->image_written = 0;
++	data->cpu_on_attempted = false;
++	data->cpu_on_ret = -EAGAIN;
++	data->next_sequence = 0;
++	data->mailmsg_last_notify_result = -EAGAIN;
++out:
++	mutex_unlock(&data->lock);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(rearm);
++
+ static void r1_amp_free_mbox_channels(struct r1_amp_cpu_on_data *data)
+ {
+ 	int i;
+@@ -1243,12 +1318,18 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	ret = device_create_file(dev, &dev_attr_status);
+ 	if (ret)
+ 		goto err_image;
+-	ret = device_create_file(dev, &dev_attr_start);
++	ret = device_create_file(dev, &dev_attr_affinity_state);
+ 	if (ret)
+ 		goto err_status;
+-	ret = device_create_file(dev, &dev_attr_ping);
++	ret = device_create_file(dev, &dev_attr_start);
++	if (ret)
++		goto err_affinity_state;
++	ret = device_create_file(dev, &dev_attr_rearm);
+ 	if (ret)
+ 		goto err_start;
++	ret = device_create_file(dev, &dev_attr_ping);
++	if (ret)
++		goto err_rearm;
+ 	ret = device_create_file(dev, &dev_attr_response);
+ 	if (ret)
+ 		goto err_ping;
+@@ -1289,8 +1370,12 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	device_remove_file(dev, &dev_attr_response);
+ err_ping:
+ 	device_remove_file(dev, &dev_attr_ping);
++err_rearm:
++	device_remove_file(dev, &dev_attr_rearm);
+ err_start:
+ 	device_remove_file(dev, &dev_attr_start);
++err_affinity_state:
++	device_remove_file(dev, &dev_attr_affinity_state);
+ err_status:
+ 	device_remove_file(dev, &dev_attr_status);
+ err_image:
+@@ -1320,7 +1405,9 @@ static int r1_amp_cpu_on_remove(struct platform_device *pdev)
+ 	device_remove_file(&pdev->dev, &dev_attr_doorbell);
+ 	device_remove_file(&pdev->dev, &dev_attr_response);
+ 	device_remove_file(&pdev->dev, &dev_attr_ping);
++	device_remove_file(&pdev->dev, &dev_attr_rearm);
+ 	device_remove_file(&pdev->dev, &dev_attr_start);
++	device_remove_file(&pdev->dev, &dev_attr_affinity_state);
+ 	device_remove_file(&pdev->dev, &dev_attr_status);
+ 	sysfs_remove_bin_file(&pdev->dev.kobj, &data->image_attr);
+ 	r1_amp_free_mbox_channels(data);
+-- 
+2.55.0
+

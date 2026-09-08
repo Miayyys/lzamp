@@ -1,0 +1,328 @@
+From 5eeb10dad5daa4250d75dc493aa3e5c32ebc8876 Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Sat, 29 Aug 2026 21:27:47 +0800
+Subject: [PATCH 06/12] soc: rockchip: expose MailMsg priority devices
+
+---
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 226 ++++++++++++++++++
+ 1 file changed, 226 insertions(+)
+
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index 20c1f54d1..77a980313 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -12,24 +12,31 @@
+ #include <asm/cacheflush.h>
+ 
+ #include <linux/err.h>
++#include <linux/atomic.h>
++#include <linux/fs.h>
+ #include <linux/io.h>
+ #include <linux/kernel.h>
+ #include <linux/mailbox_client.h>
++#include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_reserved_mem.h>
++#include <linux/poll.h>
+ #include <linux/platform_device.h>
+ #include <linux/psci.h>
+ #include <linux/slab.h>
+ #include <linux/sysfs.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
+ 
+ #include <soc/rockchip/rockchip-mailbox.h>
+ 
+ #include <uapi/linux/psci.h>
+ 
+ #include "../../../../mailmsg/mailmsg_endpoint.h"
++#include "../../../../mailmsg/mailmsg_user.h"
+ 
+ #define R1_AMP_A55_CORE3_MPIDR	0x300UL
+ #define R1_AMP_MAGIC		0x414d5031ULL /* "AMP1" */
+@@ -57,6 +64,15 @@
+ 
+ struct r1_amp_cpu_on_data;
+ 
++struct r1_amp_mailmsg_user_channel {
++	struct miscdevice miscdev;
++	struct r1_amp_cpu_on_data *parent;
++	u32 priority;
++	wait_queue_head_t rx_wait;
++	atomic_t rx_generation;
++	bool registered;
++};
++
+ /* One Linux mailbox client owns one complete, bidirectional V1 channel. */
+ struct r1_amp_mbox_channel {
+ 	struct mbox_client client;
+@@ -130,6 +146,9 @@ struct r1_amp_cpu_on_data {
+ 	int mailmsg_last_notify_result;
+ 	struct mailmsg_endpoint mailmsg_endpoint;
+ 	struct mailmsg_notify_endpoint mailmsg_notify_endpoint;
++	struct r1_amp_mailmsg_user_channel mailmsg_user[MAILMSG_PRIORITY_COUNT];
++	atomic_t mailmsg_user_open_count;
++	bool mailmsg_user_removing;
+ 	struct bin_attribute image_attr;
+ };
+ 
+@@ -145,6 +164,8 @@ static void r1_amp_mbox_rx_callback(struct mbox_client *client, void *message)
+ 		WRITE_ONCE(channel->rx_last_data, msg->data);
+ 	}
+ 	atomic_inc(&channel->rx_count);
++	atomic_inc(&channel->parent->mailmsg_user[channel->index].rx_generation);
++	wake_up_interruptible(&channel->parent->mailmsg_user[channel->index].rx_wait);
+ }
+ 
+ static const char *r1_amp_psci_state_name(int state)
+@@ -533,6 +554,188 @@ static int mailmsg_ring_result_to_errno(int result)
+ 	}
+ }
+ 
++static const char * const r1_amp_mailmsg_user_names[MAILMSG_PRIORITY_COUNT] = {
++	"mailmsg-p0", "mailmsg-p1", "mailmsg-p2", "mailmsg-p3",
++};
++
++static int r1_amp_mailmsg_user_open(struct inode *inode, struct file *file)
++{
++	struct miscdevice *miscdev = file->private_data;
++	struct r1_amp_mailmsg_user_channel *channel;
++	struct r1_amp_cpu_on_data *data;
++
++	channel = container_of(miscdev, struct r1_amp_mailmsg_user_channel,
++			       miscdev);
++	data = channel->parent;
++	mutex_lock(&data->lock);
++	if (data->mailmsg_user_removing) {
++		mutex_unlock(&data->lock);
++		return -ENODEV;
++	}
++	atomic_inc(&data->mailmsg_user_open_count);
++	mutex_unlock(&data->lock);
++	file->private_data = channel;
++	return 0;
++}
++
++static int r1_amp_mailmsg_user_release(struct inode *inode, struct file *file)
++{
++	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++
++	atomic_dec(&channel->parent->mailmsg_user_open_count);
++	return 0;
++}
++
++static ssize_t r1_amp_mailmsg_user_read(struct file *file, char __user *buf,
++					size_t count, loff_t *ppos)
++{
++	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++	struct r1_amp_cpu_on_data *data = channel->parent;
++	struct mailmsg_user_frame frame = { };
++	struct mailmsg_message message;
++	int generation;
++	int ret;
++
++	if (count != sizeof(frame))
++		return -EINVAL;
++
++	for (;;) {
++		generation = atomic_read(&channel->rx_generation);
++		mutex_lock(&data->lock);
++		if (!data->cpu_on_attempted || data->cpu_on_ret) {
++			ret = -ENODEV;
++		} else {
++			ret = mailmsg_endpoint_receive(&data->mailmsg_endpoint,
++					(enum mailmsg_priority)channel->priority,
++					&message);
++		}
++		mutex_unlock(&data->lock);
++
++		if (!ret) {
++			frame.priority = channel->priority;
++			frame.type = message.type;
++			frame.sequence = message.sequence;
++			frame.length = message.length;
++			memcpy(frame.payload, message.payload, message.length);
++			if (copy_to_user(buf, &frame, sizeof(frame)))
++				return -EFAULT;
++			return sizeof(frame);
++		}
++		if (ret != MAILMSG_RING_EMPTY)
++			return mailmsg_ring_result_to_errno(ret);
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(channel->rx_wait,
++			atomic_read(&channel->rx_generation) != generation);
++		if (ret)
++			return ret;
++	}
++}
++
++static ssize_t r1_amp_mailmsg_user_write(struct file *file,
++					 const char __user *buf, size_t count,
++					 loff_t *ppos)
++{
++	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++	struct r1_amp_cpu_on_data *data = channel->parent;
++	struct mailmsg_user_frame frame;
++	struct mailmsg_send_result send_result = { };
++	int ret;
++
++	if (count != sizeof(frame))
++		return -EINVAL;
++	if (copy_from_user(&frame, buf, sizeof(frame)))
++		return -EFAULT;
++	if (frame.priority != channel->priority ||
++	    frame.length > MAILMSG_PAYLOAD_BYTES)
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	if (!data->cpu_on_attempted || data->cpu_on_ret) {
++		ret = -ENODEV;
++	} else {
++		ret = mailmsg_endpoint_send(&data->mailmsg_endpoint,
++					(enum mailmsg_priority)channel->priority,
++					frame.type, frame.payload, frame.length,
++					&send_result);
++	}
++	mutex_unlock(&data->lock);
++	if (ret == -ENODEV)
++		return ret;
++
++	if (ret)
++		return mailmsg_ring_result_to_errno(send_result.queue_result);
++
++	return sizeof(frame);
++}
++
++static __poll_t r1_amp_mailmsg_user_poll(struct file *file,
++					 struct poll_table_struct *wait)
++{
++	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++	struct r1_amp_cpu_on_data *data = channel->parent;
++	__poll_t mask = 0;
++
++	poll_wait(file, &channel->rx_wait, wait);
++	mutex_lock(&data->lock);
++	if (data->cpu_on_attempted && !data->cpu_on_ret &&
++	    mailmsg_endpoint_has_received(&data->mailmsg_endpoint,
++					  (enum mailmsg_priority)channel->priority) > 0)
++		mask = EPOLLIN | EPOLLRDNORM;
++	mutex_unlock(&data->lock);
++
++	return mask;
++}
++
++static const struct file_operations r1_amp_mailmsg_user_fops = {
++	.owner = THIS_MODULE,
++	.open = r1_amp_mailmsg_user_open,
++	.release = r1_amp_mailmsg_user_release,
++	.read = r1_amp_mailmsg_user_read,
++	.write = r1_amp_mailmsg_user_write,
++	.poll = r1_amp_mailmsg_user_poll,
++	.llseek = no_llseek,
++};
++
++static void r1_amp_unregister_mailmsg_user(struct r1_amp_cpu_on_data *data)
++{
++	int priority;
++
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		if (data->mailmsg_user[priority].registered) {
++			misc_deregister(&data->mailmsg_user[priority].miscdev);
++			data->mailmsg_user[priority].registered = false;
++		}
++	}
++}
++
++static int r1_amp_register_mailmsg_user(struct device *dev,
++					 struct r1_amp_cpu_on_data *data)
++{
++	int priority;
++	int ret;
++
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		struct r1_amp_mailmsg_user_channel *channel =
++			&data->mailmsg_user[priority];
++
++		channel->miscdev.minor = MISC_DYNAMIC_MINOR;
++		channel->miscdev.name = r1_amp_mailmsg_user_names[priority];
++		channel->miscdev.fops = &r1_amp_mailmsg_user_fops;
++		channel->miscdev.parent = dev;
++		channel->miscdev.mode = 0600;
++		ret = misc_register(&channel->miscdev);
++		if (ret) {
++			r1_amp_unregister_mailmsg_user(data);
++			return dev_err_probe(dev, ret,
++				"failed to register MailMsg priority %d\n", priority);
++		}
++		channel->registered = true;
++	}
++
++	return 0;
++}
++
+ /* Test-only direct enqueue for CRC corruption and queue-without-doorbell. */
+ static int mailmsg_test_enqueue_locked(struct r1_amp_cpu_on_data *data,
+ 				       u32 priority, u32 value,
+@@ -917,6 +1120,7 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	struct r1_amp_cpu_on_data *data;
+ 	u32 image_size, status_offset;
+ 	u64 entry, mpidr;
++	int priority;
+ 	int ret;
+ 
+ 	if (of_property_read_u64(dev->of_node, "target-mpidr", &mpidr) ||
+@@ -960,6 +1164,13 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	data->mailmsg_notify_endpoint.ops = &mailmsg_linux_notify_ops;
+ 	data->mailmsg_notify_endpoint.context = data;
+ 	mutex_init(&data->lock);
++	atomic_set(&data->mailmsg_user_open_count, 0);
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		data->mailmsg_user[priority].parent = data;
++		data->mailmsg_user[priority].priority = priority;
++		init_waitqueue_head(&data->mailmsg_user[priority].rx_wait);
++		atomic_set(&data->mailmsg_user[priority].rx_generation, 0);
++	}
+ 	ret = r1_amp_map_mbox_regs(dev, data);
+ 	if (ret)
+ 		return ret;
+@@ -1004,11 +1215,16 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	ret = device_create_file(dev, &dev_attr_mailmsg_response);
+ 	if (ret)
+ 		goto err_mailmsg_queue_push;
++	ret = r1_amp_register_mailmsg_user(dev, data);
++	if (ret)
++		goto err_mailmsg_response;
+ 
+ 	dev_info(dev, "armed for MPIDR %#llx entry %#llx image %u bytes\n",
+ 		 mpidr, entry, image_size);
+ 	return 0;
+ 
++err_mailmsg_response:
++	device_remove_file(dev, &dev_attr_mailmsg_response);
+ err_mailmsg_queue_push:
+ 	device_remove_file(dev, &dev_attr_mailmsg_queue_push);
+ err_mailmsg_crc_inject:
+@@ -1035,6 +1251,16 @@ static int r1_amp_cpu_on_remove(struct platform_device *pdev)
+ {
+ 	struct r1_amp_cpu_on_data *data = platform_get_drvdata(pdev);
+ 
++	/* Existing file descriptors retain pointers into devm-owned state.  Refuse
++	 * unbind until callers close them instead of leaving a use-after-free. */
++	mutex_lock(&data->lock);
++	if (atomic_read(&data->mailmsg_user_open_count)) {
++		mutex_unlock(&data->lock);
++		return -EBUSY;
++	}
++	data->mailmsg_user_removing = true;
++	mutex_unlock(&data->lock);
++	r1_amp_unregister_mailmsg_user(data);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_response);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_queue_push);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_crc_inject);
+-- 
+2.55.0
+

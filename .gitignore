@@ -1,0 +1,18 @@
+/build/
+/third_party/
+# linux/ is a pinned submodule, not a vendored directory.
+/downloads/
+/artifacts/
+/models/
+/.west/
+*.img
+*.bin
+*.dtb
+*.elf
+*.o
+*.ko
+*.log
+*.patch.rej
+*.patch.orig
+__pycache__/
+*.pyc

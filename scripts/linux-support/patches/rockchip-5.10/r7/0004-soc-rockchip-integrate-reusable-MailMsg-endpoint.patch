@@ -1,0 +1,537 @@
+From 9435a2aa8243a3923f007d9ee0472b9c40c5c308 Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Sat, 29 Aug 2026 20:05:10 +0800
+Subject: [PATCH 04/12] soc: rockchip: integrate reusable MailMsg endpoint
+
+---
+ drivers/soc/rockchip/Makefile                 |   1 +
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 340 +++++++++++++-----
+ drivers/soc/rockchip/r1_mailmsg_common.c      |   4 +
+ 3 files changed, 256 insertions(+), 89 deletions(-)
+ create mode 100644 drivers/soc/rockchip/r1_mailmsg_common.c
+
+diff --git a/drivers/soc/rockchip/Makefile b/drivers/soc/rockchip/Makefile
+index bfd59623b..0afd45e55 100644
+--- a/drivers/soc/rockchip/Makefile
++++ b/drivers/soc/rockchip/Makefile
+@@ -5,6 +5,7 @@
+ obj-$(CONFIG_ROCKCHIP_AMP) += rockchip_amp.o
+ obj-$(CONFIG_ROCKCHIP_AMP_PSCI_PROBE) += r1_amp_psci_probe.o
+ obj-$(CONFIG_ROCKCHIP_AMP_PSCI_CPU_ON_HEARTBEAT) += r1_amp_psci_cpu_on_heartbeat.o
++obj-$(CONFIG_ROCKCHIP_AMP_PSCI_CPU_ON_HEARTBEAT) += r1_mailmsg_common.o
+ obj-$(CONFIG_ROCKCHIP_AMP_RPMSG_SHAREDMEM) += rockchip_amp_rpmsg_sharedmem.o
+ obj-$(CONFIG_ROCKCHIP_AMP_RPMSG_TIMESYNC) += rockchip_amp_rpmsg_timesync.o
+ obj-$(CONFIG_ROCKCHIP_CPUINFO) += rockchip-cpuinfo.o
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index 9d8f48b69..8f519c640 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -29,7 +29,7 @@
+ 
+ #include <uapi/linux/psci.h>
+ 
+-#include "../../../../mailmsg/mailmsg.h"
++#include "../../../../mailmsg/mailmsg_endpoint.h"
+ 
+ #define R1_AMP_A55_CORE3_MPIDR	0x300UL
+ #define R1_AMP_MAGIC		0x414d5031ULL /* "AMP1" */
+@@ -70,6 +70,10 @@ struct r1_amp_mbox_channel {
+ 	u32 rx_last_data;
+ 	int tx_ret;
+ 	u32 tx_count;
++	int notify_result;
++	u32 notify_sent_count;
++	u32 notify_coalesced_count;
++	u32 notify_failed_count;
+ };
+ 
+ struct r1_amp_payload_line {
+@@ -120,7 +124,9 @@ struct r1_amp_cpu_on_data {
+ 	bool affinity_queried;
+ 	bool cpu_on_attempted;
+ 	u64 next_sequence;
+-	u32 mailmsg_next_sequence;
++	int mailmsg_last_notify_result;
++	struct mailmsg_endpoint mailmsg_endpoint;
++	struct mailmsg_notify_endpoint mailmsg_notify_endpoint;
+ 	struct bin_attribute image_attr;
+ };
+ 
+@@ -186,6 +192,11 @@ static void mailmsg_linux_acquire(const void *addr, mailmsg_u32 len)
+ 	dsb(sy);
+ }
+ 
++static const struct mailmsg_memory_ops mailmsg_linux_memory_ops = {
++	.publish = mailmsg_linux_publish,
++	.acquire = mailmsg_linux_acquire,
++};
++
+ static u32 mailmsg_payload_u32(const mailmsg_u8 payload[4])
+ {
+ 	return (u32)payload[0] | ((u32)payload[1] << 8) |
+@@ -200,11 +211,10 @@ static void mailmsg_store_payload_u32(mailmsg_u8 payload[4], u32 value)
+ 	payload[3] = value >> 24;
+ }
+ 
+-/* Keep the kernel launcher on the exact MailMsg ABI without coupling it to
+- * a particular notification backend.  These are the same SPSC operations as
+- * src/mailmsg/mailmsg.c, with kernel cache hooks supplied above. */
++/* Fault-injection helper only.  Normal traffic uses mailmsg_endpoint_send(). */
+ static int mailmsg_linux_ring_push(struct mailmsg_ring *ring,
+-				   struct mailmsg_message *message)
++				   struct mailmsg_message *message,
++				   bool corrupt_payload)
+ {
+ 	mailmsg_u32 producer = ring->producer;
+ 	mailmsg_u32 next = (producer + 1U) % MAILMSG_RING_SLOTS;
+@@ -220,6 +230,13 @@ static int mailmsg_linux_ring_push(struct mailmsg_ring *ring,
+ 	*slot = *message;
+ 	slot->commit = 0;
+ 	slot->crc32 = mailmsg_frame_crc32(slot);
++	/*
++	 * Test-only fault injection.  Corrupt the payload after calculating the
++	 * CRC but before publishing either the frame or producer index.  Zephyr
++	 * therefore cannot race ahead and consume an uncorrupted frame.
++	 */
++	if (corrupt_payload)
++		slot->payload[0] ^= 0xffU;
+ 	mailmsg_linux_publish(slot, sizeof(*slot));
+ 	slot->commit = message->sequence;
+ 	mailmsg_linux_publish(&slot->commit, sizeof(slot->commit));
+@@ -228,30 +245,6 @@ static int mailmsg_linux_ring_push(struct mailmsg_ring *ring,
+ 	return 0;
+ }
+ 
+-static int mailmsg_linux_ring_pop(struct mailmsg_ring *ring,
+-				  struct mailmsg_message *message)
+-{
+-	mailmsg_u32 consumer = ring->consumer;
+-	struct mailmsg_message *slot;
+-
+-	mailmsg_linux_acquire(&ring->producer, sizeof(ring->producer));
+-	if (consumer == ring->producer)
+-		return -ENODATA;
+-
+-	slot = &ring->slot[consumer];
+-	mailmsg_linux_acquire(slot, sizeof(*slot));
+-	if (slot->commit != slot->sequence)
+-		return -EAGAIN;
+-	if (!slot->sequence || slot->length > MAILMSG_PAYLOAD_BYTES)
+-		return -EPROTO;
+-	if (slot->crc32 != mailmsg_frame_crc32(slot))
+-		return -EBADMSG;
+-	*message = *slot;
+-	ring->consumer = (consumer + 1U) % MAILMSG_RING_SLOTS;
+-	mailmsg_linux_publish(&ring->consumer, sizeof(ring->consumer));
+-	return 0;
+-}
+-
+ static int r1_amp_map_mbox_regs(struct device *dev,
+ 				 struct r1_amp_cpu_on_data *data)
+ {
+@@ -357,17 +350,20 @@ static ssize_t status_show(struct device *dev,
+ 				&ch[controller * R1_AMP_MBOX_CHANNELS_PER_CONTROLLER + channel];
+ 
+ 			ret += sysfs_emit_at(buf, ret,
+-				"m%dc%d=rx:%d/%#x/%#x,tx:%u/%d ",
++				"m%dc%d=rx:%d/%#x/%#x,tx:%u/%d,notify:%d/%u/%u/%u ",
+ 				controller, channel, atomic_read(&entry->rx_count),
+ 				READ_ONCE(entry->rx_last_cmd),
+ 				READ_ONCE(entry->rx_last_data), entry->tx_count,
+-				entry->tx_ret);
++				entry->tx_ret, entry->notify_result,
++				entry->notify_sent_count,
++				entry->notify_coalesced_count,
++				entry->notify_failed_count);
+ 		}
+ 	}
+ 	ret += sysfs_emit_at(buf, ret,
+-		"a2b_now=m0:%#x "
++		"a2b_now=m0:%#x mailmsg_notify=%d "
+ 		"mbox_observation=%#x/%#x/%#x/%#x magic=%#llx current_el=%llu\n",
+-		a2b_now_status[0],
++		a2b_now_status[0], data->mailmsg_last_notify_result,
+ 		observation_magic, observation_status,
+ 		observation_cmd, observation_data, magic, current_el);
+ 	mutex_unlock(&data->lock);
+@@ -483,19 +479,109 @@ static ssize_t doorbell_store(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_WO(doorbell);
+ 
++static int mailmsg_ring_result_to_errno(int result)
++{
++	switch (result) {
++	case MAILMSG_RING_OK:
++		return 0;
++	case MAILMSG_RING_EMPTY:
++		return -ENODATA;
++	case MAILMSG_RING_FULL:
++		return -ENOSPC;
++	case MAILMSG_RING_INCOMPLETE:
++		return -EAGAIN;
++	case MAILMSG_RING_BAD_CRC:
++		return -EBADMSG;
++	case MAILMSG_RING_INVALID:
++		return -EPROTO;
++	default:
++		return -EIO;
++	}
++}
++
++/* Test-only direct enqueue for CRC corruption and queue-without-doorbell. */
++static int mailmsg_test_enqueue_locked(struct r1_amp_cpu_on_data *data,
++				       u32 priority, u32 value,
++				       bool corrupt_payload)
++{
++	struct mailmsg_shared *shared;
++	struct mailmsg_message request = { };
++
++	shared = mailmsg_linux_shared_ptr(data);
++	mailmsg_linux_acquire(shared, sizeof(*shared));
++	if (shared->magic != MAILMSG_PROTOCOL_MAGIC ||
++	    shared->version != MAILMSG_PROTOCOL_VERSION) {
++		return -EPROTO;
++	}
++
++	request.type = MAILMSG_MSG_PING;
++	request.sequence = ++data->mailmsg_endpoint.next_sequence;
++	if (!request.sequence)
++		request.sequence = ++data->mailmsg_endpoint.next_sequence;
++	request.length = sizeof(value);
++	mailmsg_store_payload_u32(request.payload, value);
++	return mailmsg_linux_ring_push(&shared->linux_to_cpu3[priority], &request,
++				       corrupt_payload);
++}
++
++/* Caller holds data->lock.  mbox_send_message() queues first in the generic
++ * Linux mailbox core, so its non-negative cookie does not say that hardware
++ * accepted a fresh doorbell.  Inspect A2B_STATUS before submitting: when the
++ * selected bit is already pending, do not create a redundant core-TX queue
++ * entry.  The earlier doorbell will make CPU3 poll this priority ring. */
++static int mailmsg_notify_locked(struct r1_amp_cpu_on_data *data, u32 priority)
++{
++	struct r1_amp_mbox_channel *channel = &data->mbox[priority];
++	u32 status;
++	int result;
++
++	channel->tx_msg.cmd = R1_AMP_MAILMSG_DOORBELL | priority;
++	channel->tx_msg.data = priority;
++	status = readl_relaxed(data->mbox_regs[channel->controller] +
++			       R1_AMP_MBOX_A2B_STATUS);
++	if (status & BIT(channel->controller_channel)) {
++		/* Expose the observed hardware-busy reason without submitting. */
++		channel->tx_ret = -EBUSY;
++		result = MAILMSG_NOTIFY_COALESCED;
++		channel->notify_coalesced_count++;
++	} else {
++		channel->tx_ret = mbox_send_message(channel->chan, &channel->tx_msg);
++		if (channel->tx_ret < 0) {
++			result = channel->tx_ret;
++			channel->notify_failed_count++;
++		} else {
++			result = MAILMSG_NOTIFY_SENT;
++			channel->tx_count++;
++			channel->notify_sent_count++;
++		}
++	}
++
++	channel->notify_result = result;
++	data->mailmsg_last_notify_result = result;
++	return result;
++}
++
++static int mailmsg_linux_notify(void *context,
++				enum mailmsg_priority priority)
++{
++	return mailmsg_notify_locked(context, priority);
++}
++
++static const struct mailmsg_notify_ops mailmsg_linux_notify_ops = {
++	.notify = mailmsg_linux_notify,
++};
++
+ /*
+- * MailMsg V1 entry point.  Input is "priority value".  The message is put
++ * MailMsg test entry point.  Input is "priority value".  The message is put
+  * into the priority's Linux->CPU3 SPSC ring before its matching doorbell is
+  * sent.  The mailbox carries only a wake-up/priority hint, never payload.
+  */
+-static ssize_t mailmsg_ping_store(struct device *dev,
+-				  struct device_attribute *attr,
+-				  const char *buf, size_t count)
++static ssize_t mailmsg_send_ping(struct device *dev, const char *buf,
++				 size_t count, bool corrupt_payload)
+ {
+ 	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
+-	struct mailmsg_shared *shared;
+-	struct mailmsg_message request = { };
+-	struct r1_amp_mbox_channel *channel;
++	struct mailmsg_send_result send_result;
++	mailmsg_u8 payload[sizeof(u32)];
+ 	u32 priority, value;
+ 	int ret;
+ 
+@@ -509,75 +595,127 @@ static ssize_t mailmsg_ping_store(struct device *dev,
+ 		goto out;
+ 	}
+ 
+-	shared = mailmsg_linux_shared_ptr(data);
+-	mailmsg_linux_acquire(shared, sizeof(*shared));
+-	if (shared->magic != MAILMSG_PROTOCOL_MAGIC ||
+-	    shared->version != MAILMSG_PROTOCOL_VERSION) {
+-		ret = -EPROTO;
+-		goto out;
+-	}
+-
+-	request.type = MAILMSG_MSG_PING;
+-	request.sequence = ++data->mailmsg_next_sequence;
+-	if (!request.sequence)
+-		request.sequence = ++data->mailmsg_next_sequence;
+-	request.length = sizeof(value);
+-	mailmsg_store_payload_u32(request.payload, value);
+-	ret = mailmsg_linux_ring_push(&shared->linux_to_cpu3[priority], &request);
+-	if (ret)
+-		goto out;
+-
+-	channel = &data->mbox[priority];
+-	channel->tx_msg.cmd = R1_AMP_MAILMSG_DOORBELL | priority;
+-	channel->tx_msg.data = priority;
+-	channel->tx_ret = mbox_send_message(channel->chan, &channel->tx_msg);
+-	if (channel->tx_ret < 0) {
+-		ret = channel->tx_ret;
+-		goto out;
++	if (corrupt_payload) {
++		ret = mailmsg_test_enqueue_locked(data, priority, value, true);
++		if (ret)
++			goto out;
++		ret = mailmsg_notify_locked(data, priority);
++	} else {
++		mailmsg_store_payload_u32(payload, value);
++		ret = mailmsg_endpoint_send(&data->mailmsg_endpoint,
++					    (enum mailmsg_priority)priority,
++					    MAILMSG_MSG_PING, payload,
++					    sizeof(payload), &send_result);
++		if (ret) {
++			ret = mailmsg_ring_result_to_errno(send_result.queue_result);
++			goto out;
++		}
++		ret = send_result.notify_result;
+ 	}
+-	channel->tx_count++;
++	/* The sysfs write reports data-plane admission.  Notification outcome is
++	 * independently observable in status; a future upper API may retry or
++	 * degrade on a negative result, but this prototype never rolls back a
++	 * committed frame. */
++	if (!mailmsg_notify_accepted(ret) && ret < 0)
++		dev_warn(dev, "mailmsg priority %u queued but notify failed: %d\n",
++			 priority, ret);
+ 	ret = count;
+ out:
+ 	mutex_unlock(&data->lock);
+ 	return ret;
+ }
++
++static ssize_t mailmsg_ping_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	return mailmsg_send_ping(dev, buf, count, false);
++}
+ static DEVICE_ATTR_WO(mailmsg_ping);
+ 
+-/* Reading consumes at most one response from each independent priority ring. */
++/*
++ * Test-only entry point.  Input matches mailmsg_ping ("priority value"),
++ * but one payload byte is changed after CRC generation.  The frame keeps a
++ * valid commit so the remote side must reject it specifically as BAD_CRC.
++ */
++static ssize_t mailmsg_crc_inject_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	return mailmsg_send_ping(dev, buf, count, true);
++}
++static DEVICE_ATTR_WO(mailmsg_crc_inject);
++
++/* Test-only queue boundary hook.  It intentionally omits a doorbell and may
++ * run before CPU3 starts, so a test can observe the ring's immediate -ENOSPC
++ * result without mailbox state or remote scheduling influencing the result. */
++static ssize_t mailmsg_queue_push_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
++	u32 priority, value;
++	int ret;
++
++	if (sscanf(buf, "%u %u", &priority, &value) != 2 ||
++	    priority >= MAILMSG_PRIORITY_COUNT)
++		return -EINVAL;
++
++	mutex_lock(&data->lock);
++	ret = mailmsg_test_enqueue_locked(data, priority, value, false);
++	mutex_unlock(&data->lock);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(mailmsg_queue_push);
++
++/* Drain independent reverse rings.  V3 feedback frames carry the original
++ * sequence in payload[0..3], followed by ACK status or NACK reason. */
+ static ssize_t mailmsg_response_show(struct device *dev,
+ 				     struct device_attribute *attr, char *buf)
+ {
+ 	struct r1_amp_cpu_on_data *data = dev_get_drvdata(dev);
+-	struct mailmsg_shared *shared;
+ 	struct mailmsg_message response;
+ 	int priority;
+ 	ssize_t ret = 0;
+ 
+ 	mutex_lock(&data->lock);
+-	shared = mailmsg_linux_shared_ptr(data);
+-	mailmsg_linux_acquire(shared, sizeof(*shared));
+-	if (shared->magic != MAILMSG_PROTOCOL_MAGIC ||
+-	    shared->version != MAILMSG_PROTOCOL_VERSION) {
++	if (!data->mailmsg_endpoint.rx) {
+ 		ret = sysfs_emit(buf, "valid=0 reason=protocol-not-ready\n");
+ 		goto out;
+ 	}
+ 
+ 	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
+-		int pop_ret = mailmsg_linux_ring_pop(&shared->cpu3_to_linux[priority],
+-						  &response);
+-
+-		if (pop_ret == -ENODATA)
+-			continue;
+-		if (pop_ret) {
+-			ret += sysfs_emit_at(buf, ret, "priority=%d valid=0 ret=%d\n",
+-					     priority, pop_ret);
+-			continue;
++		int pop_ret;
++
++		while ((pop_ret = mailmsg_endpoint_receive(
++			       &data->mailmsg_endpoint,
++			       (enum mailmsg_priority)priority, &response)) !=
++		       MAILMSG_RING_EMPTY) {
++			if (pop_ret) {
++				ret += sysfs_emit_at(buf, ret,
++					"priority=%d valid=0 ret=%d\n", priority, pop_ret);
++				if (pop_ret == MAILMSG_RING_INCOMPLETE)
++					break;
++				continue;
++			}
++			if ((response.type == MAILMSG_MSG_ACK ||
++			     response.type == MAILMSG_MSG_NACK) &&
++			    response.length >= MAILMSG_FEEDBACK_BYTES) {
++				ret += sysfs_emit_at(buf, ret,
++					"priority=%d valid=1 type=%u sequence=%u peer_sequence=%u status=%d\n",
++					priority, response.type, response.sequence,
++					mailmsg_payload_u32(
++						&response.payload[MAILMSG_FEEDBACK_SEQUENCE_OFFSET]),
++					(s32)mailmsg_payload_u32(
++						&response.payload[MAILMSG_FEEDBACK_STATUS_OFFSET]));
++			} else {
++				ret += sysfs_emit_at(buf, ret,
++					"priority=%d valid=1 type=%u sequence=%u value=%u\n",
++					priority, response.type, response.sequence,
++					response.length >= sizeof(u32) ?
++					mailmsg_payload_u32(response.payload) : 0);
++			}
+ 		}
+-		ret += sysfs_emit_at(buf, ret,
+-			"priority=%d valid=1 type=%u sequence=%u value=%u\n",
+-			priority, response.type, response.sequence,
+-			response.length >= sizeof(u32) ?
+-			mailmsg_payload_u32(response.payload) : 0);
+ 	}
+ 	if (!ret)
+ 		ret = sysfs_emit(buf, "valid=0 reason=empty\n");
+@@ -661,6 +799,15 @@ static ssize_t start_store(struct device *dev,
+ 	mailmsg_linux_shared_ptr(data)->version = MAILMSG_PROTOCOL_VERSION;
+ 	__flush_dcache_area(r1_amp_status_ptr(data), R1_AMP_STATE_SIZE);
+ 	dsb(sy);
++	ret = mailmsg_endpoint_bind(&data->mailmsg_endpoint,
++				    mailmsg_linux_shared_ptr(data),
++				    &mailmsg_linux_memory_ops,
++				    &data->mailmsg_notify_endpoint,
++				    MAILMSG_ENDPOINT_LINUX);
++	if (ret) {
++		ret = -EPROTO;
++		goto out;
++	}
+ 
+ 	data->cpu_on_attempted = true;
+ 	data->cpu_on_ret = psci_ops.cpu_on(data->mpidr, data->entry);
+@@ -711,6 +858,7 @@ static int r1_amp_request_mbox_channels(struct device *dev,
+ 		channel->client.rx_callback = r1_amp_mbox_rx_callback;
+ 		atomic_set(&channel->rx_count, 0);
+ 		channel->tx_ret = -EAGAIN;
++		channel->notify_result = -EAGAIN;
+ 		channel->chan = mbox_request_channel_byname(&channel->client,
+ 							    names[i]);
+ 		if (IS_ERR(channel->chan)) {
+@@ -722,6 +870,7 @@ static int r1_amp_request_mbox_channels(struct device *dev,
+ 					     names[i]);
+ 		}
+ 	}
++	data->mailmsg_last_notify_result = -EAGAIN;
+ 
+ 	return 0;
+ }
+@@ -774,6 +923,8 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	data->image_size = image_size;
+ 	data->status_offset = status_offset;
+ 	data->cpu_on_ret = -EAGAIN;
++	data->mailmsg_notify_endpoint.ops = &mailmsg_linux_notify_ops;
++	data->mailmsg_notify_endpoint.context = data;
+ 	mutex_init(&data->lock);
+ 	ret = r1_amp_map_mbox_regs(dev, data);
+ 	if (ret)
+@@ -810,15 +961,24 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 	ret = device_create_file(dev, &dev_attr_mailmsg_ping);
+ 	if (ret)
+ 		goto err_doorbell;
+-	ret = device_create_file(dev, &dev_attr_mailmsg_response);
++	ret = device_create_file(dev, &dev_attr_mailmsg_crc_inject);
+ 	if (ret)
+ 		goto err_mailmsg_ping;
++	ret = device_create_file(dev, &dev_attr_mailmsg_queue_push);
++	if (ret)
++		goto err_mailmsg_crc_inject;
++	ret = device_create_file(dev, &dev_attr_mailmsg_response);
++	if (ret)
++		goto err_mailmsg_queue_push;
+ 
+ 	dev_info(dev, "armed for MPIDR %#llx entry %#llx image %u bytes\n",
+ 		 mpidr, entry, image_size);
+ 	return 0;
+ 
+-
++err_mailmsg_queue_push:
++	device_remove_file(dev, &dev_attr_mailmsg_queue_push);
++err_mailmsg_crc_inject:
++	device_remove_file(dev, &dev_attr_mailmsg_crc_inject);
+ err_mailmsg_ping:
+ 	device_remove_file(dev, &dev_attr_mailmsg_ping);
+ err_doorbell:
+@@ -842,6 +1002,8 @@ static int r1_amp_cpu_on_remove(struct platform_device *pdev)
+ 	struct r1_amp_cpu_on_data *data = platform_get_drvdata(pdev);
+ 
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_response);
++	device_remove_file(&pdev->dev, &dev_attr_mailmsg_queue_push);
++	device_remove_file(&pdev->dev, &dev_attr_mailmsg_crc_inject);
+ 	device_remove_file(&pdev->dev, &dev_attr_mailmsg_ping);
+ 	device_remove_file(&pdev->dev, &dev_attr_doorbell);
+ 	device_remove_file(&pdev->dev, &dev_attr_response);
+diff --git a/drivers/soc/rockchip/r1_mailmsg_common.c b/drivers/soc/rockchip/r1_mailmsg_common.c
+new file mode 100644
+index 000000000..56861843d
+--- /dev/null
++++ b/drivers/soc/rockchip/r1_mailmsg_common.c
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier: MIT
++/* Build the transport-neutral MailMsg implementation into this kernel. */
++#include "../../../../mailmsg/mailmsg.c"
++#include "../../../../mailmsg/mailmsg_endpoint.c"
+-- 
+2.55.0
+

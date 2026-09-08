@@ -1,0 +1,180 @@
+From 9de5ca97a02023e6cdcc1e5359b03c6022b1877e Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Sun, 30 Aug 2026 10:34:02 +0800
+Subject: [PATCH 09/12] soc: rockchip: report stopped MailMsg endpoint offline
+
+---
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 71 +++++++++++++++++--
+ 1 file changed, 65 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index 32d57e56f..d983cf7dc 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -64,6 +64,13 @@
+ 
+ struct r1_amp_cpu_on_data;
+ 
++/* Local Linux-side lifecycle only; it is not part of the shared ABI. */
++enum r1_amp_mailmsg_session_state {
++	R1_AMP_MAILMSG_UNARMED,
++	R1_AMP_MAILMSG_ACTIVE,
++	R1_AMP_MAILMSG_OFFLINE,
++};
++
+ struct r1_amp_mailmsg_user_channel {
+ 	struct miscdevice miscdev;
+ 	struct r1_amp_cpu_on_data *parent;
+@@ -149,6 +156,7 @@ struct r1_amp_cpu_on_data {
+ 	int cpu_on_ret;
+ 	bool affinity_queried;
+ 	bool cpu_on_attempted;
++	enum r1_amp_mailmsg_session_state mailmsg_state;
+ 	u64 next_sequence;
+ 	int mailmsg_last_notify_result;
+ 	struct mailmsg_endpoint mailmsg_endpoint;
+@@ -189,6 +197,38 @@ static const char *r1_amp_psci_state_name(int state)
+ 	}
+ }
+ 
++static const char *r1_amp_mailmsg_state_name(
++		enum r1_amp_mailmsg_session_state state)
++{
++	switch (state) {
++	case R1_AMP_MAILMSG_UNARMED:
++		return "unarmed";
++	case R1_AMP_MAILMSG_ACTIVE:
++		return "active";
++	case R1_AMP_MAILMSG_OFFLINE:
++		return "offline";
++	}
++
++	return "unknown";
++}
++
++/* Caller holds data->lock.  Wake every priority so blocking readers observe
++ * the terminal endpoint state instead of sleeping for a mailbox IRQ that can
++ * no longer arrive from the stopped CPU. */
++static void r1_amp_mailmsg_mark_offline_locked(struct r1_amp_cpu_on_data *data)
++{
++	int priority;
++
++	if (data->mailmsg_state != R1_AMP_MAILMSG_ACTIVE)
++		return;
++
++	data->mailmsg_state = R1_AMP_MAILMSG_OFFLINE;
++	for (priority = 0; priority < MAILMSG_PRIORITY_COUNT; priority++) {
++		atomic_inc(&data->mailmsg_user[priority].rx_generation);
++		wake_up_interruptible(&data->mailmsg_user[priority].rx_wait);
++	}
++}
++
+ static void *r1_amp_status_ptr(struct r1_amp_cpu_on_data *data)
+ {
+ 	return data->carveout + data->status_offset;
+@@ -398,10 +438,11 @@ static ssize_t status_show(struct device *dev,
+ 				      R1_AMP_MBOX_A2B_STATUS);
+ 	ch = data->mbox;
+ 	ret = sysfs_emit(buf,
+-		"image=%zu/%u affinity=%s (%d) cpu_on_attempted=%u cpu_on_ret=%d ",
++		"image=%zu/%u affinity=%s (%d) mailmsg_state=%s cpu_on_attempted=%u cpu_on_ret=%d ",
+ 		data->image_written, data->image_size,
+ 		data->affinity_queried ? r1_amp_psci_state_name(data->affinity_state) : "not-queried",
+-		data->affinity_state, data->cpu_on_attempted, data->cpu_on_ret);
++		data->affinity_state, r1_amp_mailmsg_state_name(data->mailmsg_state),
++		data->cpu_on_attempted, data->cpu_on_ret);
+ 	for (controller = 0; controller < R1_AMP_MBOX_CONTROLLERS; controller++) {
+ 		for (channel = 0; channel < R1_AMP_MBOX_CHANNELS_PER_CONTROLLER;
+ 		     channel++) {
+@@ -448,6 +489,8 @@ static ssize_t affinity_state_show(struct device *dev,
+ 	state = psci_ops.affinity_info(data->mpidr, 0);
+ 	data->affinity_state = state;
+ 	data->affinity_queried = true;
++	if (!data->cpu_on_ret && state == PSCI_0_2_AFFINITY_LEVEL_OFF)
++		r1_amp_mailmsg_mark_offline_locked(data);
+ 	mutex_unlock(&data->lock);
+ 
+ 	return sysfs_emit(buf, "mpidr=%#llx level=0 state=%s (%d)\n",
+@@ -606,6 +649,11 @@ static int r1_amp_mailmsg_user_open(struct inode *inode, struct file *file)
+ 		kfree(user_file);
+ 		return -ENODEV;
+ 	}
++	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
++		mutex_unlock(&data->lock);
++		kfree(user_file);
++		return -ENOLINK;
++	}
+ 	atomic_inc(&data->mailmsg_user_open_count);
+ 	mutex_unlock(&data->lock);
+ 	user_file->channel = channel;
+@@ -669,7 +717,9 @@ static ssize_t r1_amp_mailmsg_user_read(struct file *file, char __user *buf,
+ 	for (;;) {
+ 		generation = atomic_read(&channel->rx_generation);
+ 		mutex_lock(&data->lock);
+-		if (!data->cpu_on_attempted || data->cpu_on_ret) {
++		if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
++			ret = -ENOLINK;
++		} else if (!data->cpu_on_attempted || data->cpu_on_ret) {
+ 			ret = -ENODEV;
+ 		} else {
+ 			ret = mailmsg_endpoint_receive(&data->mailmsg_endpoint,
+@@ -688,6 +738,8 @@ static ssize_t r1_amp_mailmsg_user_read(struct file *file, char __user *buf,
+ 				return -EFAULT;
+ 			return sizeof(frame);
+ 		}
++		if (ret == -ENODEV || ret == -ENOLINK)
++			return ret;
+ 		if (ret != MAILMSG_RING_EMPTY)
+ 			return mailmsg_ring_result_to_errno(ret);
+ 		if (file->f_flags & O_NONBLOCK)
+@@ -719,7 +771,9 @@ static ssize_t r1_amp_mailmsg_user_write(struct file *file,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&data->lock);
+-	if (!data->cpu_on_attempted || data->cpu_on_ret) {
++	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
++		ret = -ENOLINK;
++	} else if (!data->cpu_on_attempted || data->cpu_on_ret) {
+ 		ret = -ENODEV;
+ 	} else {
+ 		ret = mailmsg_endpoint_send(&data->mailmsg_endpoint,
+@@ -728,7 +782,7 @@ static ssize_t r1_amp_mailmsg_user_write(struct file *file,
+ 					&send_result);
+ 	}
+ 	mutex_unlock(&data->lock);
+-	if (ret == -ENODEV)
++	if (ret == -ENODEV || ret == -ENOLINK)
+ 		return ret;
+ 
+ 	if (ret)
+@@ -750,7 +804,9 @@ static __poll_t r1_amp_mailmsg_user_poll(struct file *file,
+ 
+ 	poll_wait(file, &channel->rx_wait, wait);
+ 	mutex_lock(&data->lock);
+-	if (data->cpu_on_attempted && !data->cpu_on_ret &&
++	if (data->mailmsg_state == R1_AMP_MAILMSG_OFFLINE) {
++		mask = EPOLLHUP | EPOLLERR;
++	} else if (data->cpu_on_attempted && !data->cpu_on_ret &&
+ 	    mailmsg_endpoint_has_received(&data->mailmsg_endpoint,
+ 					  (enum mailmsg_priority)channel->priority) > 0)
+ 		mask = EPOLLIN | EPOLLRDNORM;
+@@ -1120,6 +1176,8 @@ static ssize_t start_store(struct device *dev,
+ 
+ 	data->cpu_on_attempted = true;
+ 	data->cpu_on_ret = psci_ops.cpu_on(data->mpidr, data->entry);
++	data->mailmsg_state = data->cpu_on_ret ? R1_AMP_MAILMSG_UNARMED :
++		R1_AMP_MAILMSG_ACTIVE;
+ 	ret = data->cpu_on_ret;
+ 	out:
+ 	mutex_unlock(&data->lock);
+@@ -1173,6 +1231,7 @@ static ssize_t rearm_store(struct device *dev,
+ 	data->image_written = 0;
+ 	data->cpu_on_attempted = false;
+ 	data->cpu_on_ret = -EAGAIN;
++	data->mailmsg_state = R1_AMP_MAILMSG_UNARMED;
+ 	data->next_sequence = 0;
+ 	data->mailmsg_last_notify_result = -EAGAIN;
+ out:
+-- 
+2.55.0
+

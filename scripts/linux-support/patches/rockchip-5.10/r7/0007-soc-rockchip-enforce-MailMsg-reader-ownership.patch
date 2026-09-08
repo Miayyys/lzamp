@@ -1,0 +1,151 @@
+From b586d1c09fe09dbc77a016744eb1082eda534382 Mon Sep 17 00:00:00 2001
+From: Miayyys <467848938@qq.com>
+Date: Sun, 30 Aug 2026 09:23:29 +0800
+Subject: [PATCH 07/12] soc: rockchip: enforce MailMsg reader ownership
+
+---
+ .../rockchip/r1_amp_psci_cpu_on_heartbeat.c   | 64 +++++++++++++++++--
+ 1 file changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+index 77a980313..a7de639aa 100644
+--- a/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
++++ b/drivers/soc/rockchip/r1_amp_psci_cpu_on_heartbeat.c
+@@ -70,9 +70,16 @@ struct r1_amp_mailmsg_user_channel {
+ 	u32 priority;
+ 	wait_queue_head_t rx_wait;
+ 	atomic_t rx_generation;
++	/* The shared reverse ring has exactly one Linux-side consumer. */
++	atomic_t reader_open_count;
+ 	bool registered;
+ };
+ 
++struct r1_amp_mailmsg_user_file {
++	struct r1_amp_mailmsg_user_channel *channel;
++	bool reader_claimed;
++};
++
+ /* One Linux mailbox client owns one complete, bidirectional V1 channel. */
+ struct r1_amp_mbox_channel {
+ 	struct mbox_client client;
+@@ -563,6 +570,11 @@ static int r1_amp_mailmsg_user_open(struct inode *inode, struct file *file)
+ 	struct miscdevice *miscdev = file->private_data;
+ 	struct r1_amp_mailmsg_user_channel *channel;
+ 	struct r1_amp_cpu_on_data *data;
++	struct r1_amp_mailmsg_user_file *user_file;
++
++	user_file = kzalloc(sizeof(*user_file), GFP_KERNEL);
++	if (!user_file)
++		return -ENOMEM;
+ 
+ 	channel = container_of(miscdev, struct r1_amp_mailmsg_user_channel,
+ 			       miscdev);
+@@ -570,26 +582,57 @@ static int r1_amp_mailmsg_user_open(struct inode *inode, struct file *file)
+ 	mutex_lock(&data->lock);
+ 	if (data->mailmsg_user_removing) {
+ 		mutex_unlock(&data->lock);
++		kfree(user_file);
+ 		return -ENODEV;
+ 	}
+ 	atomic_inc(&data->mailmsg_user_open_count);
+ 	mutex_unlock(&data->lock);
+-	file->private_data = channel;
++	user_file->channel = channel;
++	file->private_data = user_file;
+ 	return 0;
+ }
+ 
+ static int r1_amp_mailmsg_user_release(struct inode *inode, struct file *file)
+ {
+-	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++	struct r1_amp_mailmsg_user_file *user_file = file->private_data;
++	struct r1_amp_mailmsg_user_channel *channel = user_file->channel;
++	struct r1_amp_cpu_on_data *data = channel->parent;
+ 
+-	atomic_dec(&channel->parent->mailmsg_user_open_count);
++	mutex_lock(&data->lock);
++	if (user_file->reader_claimed)
++		atomic_dec(&channel->reader_open_count);
++	atomic_dec(&data->mailmsg_user_open_count);
++	mutex_unlock(&data->lock);
++	kfree(user_file);
+ 	return 0;
+ }
+ 
++static int r1_amp_mailmsg_user_claim_reader(
++		struct r1_amp_mailmsg_user_file *user_file)
++{
++	struct r1_amp_mailmsg_user_channel *channel = user_file->channel;
++	struct r1_amp_cpu_on_data *data = channel->parent;
++	int ret = 0;
++
++	mutex_lock(&data->lock);
++	if (!user_file->reader_claimed) {
++		if (atomic_read(&channel->reader_open_count)) {
++			ret = -EBUSY;
++		} else {
++			atomic_inc(&channel->reader_open_count);
++			user_file->reader_claimed = true;
++		}
++	}
++	mutex_unlock(&data->lock);
++
++	return ret;
++}
++
+ static ssize_t r1_amp_mailmsg_user_read(struct file *file, char __user *buf,
+ 					size_t count, loff_t *ppos)
+ {
+-	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++	struct r1_amp_mailmsg_user_file *user_file = file->private_data;
++	struct r1_amp_mailmsg_user_channel *channel = user_file->channel;
+ 	struct r1_amp_cpu_on_data *data = channel->parent;
+ 	struct mailmsg_user_frame frame = { };
+ 	struct mailmsg_message message;
+@@ -598,6 +641,9 @@ static ssize_t r1_amp_mailmsg_user_read(struct file *file, char __user *buf,
+ 
+ 	if (count != sizeof(frame))
+ 		return -EINVAL;
++	ret = r1_amp_mailmsg_user_claim_reader(user_file);
++	if (ret)
++		return ret;
+ 
+ 	for (;;) {
+ 		generation = atomic_read(&channel->rx_generation);
+@@ -636,7 +682,8 @@ static ssize_t r1_amp_mailmsg_user_write(struct file *file,
+ 					 const char __user *buf, size_t count,
+ 					 loff_t *ppos)
+ {
+-	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++	struct r1_amp_mailmsg_user_file *user_file = file->private_data;
++	struct r1_amp_mailmsg_user_channel *channel = user_file->channel;
+ 	struct r1_amp_cpu_on_data *data = channel->parent;
+ 	struct mailmsg_user_frame frame;
+ 	struct mailmsg_send_result send_result = { };
+@@ -672,10 +719,14 @@ static ssize_t r1_amp_mailmsg_user_write(struct file *file,
+ static __poll_t r1_amp_mailmsg_user_poll(struct file *file,
+ 					 struct poll_table_struct *wait)
+ {
+-	struct r1_amp_mailmsg_user_channel *channel = file->private_data;
++	struct r1_amp_mailmsg_user_file *user_file = file->private_data;
++	struct r1_amp_mailmsg_user_channel *channel = user_file->channel;
+ 	struct r1_amp_cpu_on_data *data = channel->parent;
+ 	__poll_t mask = 0;
+ 
++	if (r1_amp_mailmsg_user_claim_reader(user_file))
++		return EPOLLERR;
++
+ 	poll_wait(file, &channel->rx_wait, wait);
+ 	mutex_lock(&data->lock);
+ 	if (data->cpu_on_attempted && !data->cpu_on_ret &&
+@@ -1170,6 +1221,7 @@ static int r1_amp_cpu_on_probe(struct platform_device *pdev)
+ 		data->mailmsg_user[priority].priority = priority;
+ 		init_waitqueue_head(&data->mailmsg_user[priority].rx_wait);
+ 		atomic_set(&data->mailmsg_user[priority].rx_generation, 0);
++		atomic_set(&data->mailmsg_user[priority].reader_open_count, 0);
+ 	}
+ 	ret = r1_amp_map_mbox_regs(dev, data);
+ 	if (ret)
+-- 
+2.55.0
+

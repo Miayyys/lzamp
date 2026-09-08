@@ -1,0 +1,94 @@
+/* SPDX-License-Identifier: MIT */
+/* Do not claim the Linux Debug UART while CPU3 is the AMP core. */
+&uart2 {
+	status = "disabled";
+};
+
+/* Keep the final 4 KiB of the 4 MiB Zephyr region for MailMsg control. */
+&dram {
+	reg = <0x50000000 0x003ff000>;
+};
+
+/*
+ * Zephyr-owned RK3588S expansion resources.  Private bounded polling drivers
+ * map these MMIO ranges directly; status stays reserved because these are an
+ * ownership inventory, not Zephyr device-model bindings.  I2C7 and SPI0 are
+ * mutually exclusive build profiles because GPIO3_D3 is shared.
+ */
+/ {
+	lzamp_gpio3: gpio@fec40000 {
+		reg = <0xfec40000 0x100>;
+		/* Shared with Linux at controller level; polling-only on reserved lines. */
+		status = "reserved";
+	};
+
+	lzamp_uart5: serial@feb80000 {
+		reg = <0xfeb80000 0x100>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 336 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		reg-shift = <2>;
+		reg-io-width = <4>;
+		status = "reserved";
+	};
+
+	lzamp_uart7: serial@feba0000 {
+		reg = <0xfeba0000 0x100>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 338 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		reg-shift = <2>;
+		reg-io-width = <4>;
+		status = "reserved";
+	};
+
+	lzamp_i2c7: i2c@fec90000 {
+		reg = <0xfec90000 0x1000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 324 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "reserved";
+	};
+
+	/* Alternate to the default I2C7 + GPIO3 D-line profile. */
+	lzamp_spi0: spi@feb00000 {
+		reg = <0xfeb00000 0x1000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 326 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "reserved";
+	};
+
+	/* PWM4-7 are one Zephyr-owned clock/reset bank. */
+	lzamp_pwm4: pwm@febd0000 {
+		reg = <0xfebd0000 0x10>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 346 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "reserved";
+	};
+
+	lzamp_pwm5: pwm@febd0010 {
+		reg = <0xfebd0010 0x10>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 346 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "reserved";
+	};
+
+	lzamp_pwm6: pwm@febd0020 {
+		reg = <0xfebd0020 0x10>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 346 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "reserved";
+	};
+
+	lzamp_pwm7: pwm@febd0030 {
+		reg = <0xfebd0030 0x10>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 346 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>,
+			     <GIC_SPI 347 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "reserved";
+	};
+
+	lzamp_saradc: adc@fec10000 {
+		reg = <0xfec10000 0x10000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 398 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		status = "reserved";
+	};
+};

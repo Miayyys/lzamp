@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "status": "source-snapshot",
+  "repositories": {
+    "main": {"remote": "git@github.com:Miayyys/lzamp.git", "kernel_path": "linux"},
+    "kernel": {
+      "remote": "git@github.com:Miayyys/lzamp-linux.git",
+      "upstream": "https://github.com/rockchip-linux/kernel.git",
+      "base_commit": "470f9dccbdc42e7b8a824d0a5c5640a10e9457d2",
+      "integration_commit": "8ea201823a004751363b657b5999ebafcc99ae06",
+      "history_mode": "single-root-commit",
+      "retain_upstream_board_definitions": true
+    }
+  },
+  "license_review": {
+    "status": "complete",
+    "blanket_license": null,
+    "first_party_default": "MIT",
+    "scope_notice": "NOTICE",
+    "observed_identifiers": ["MIT", "Apache-2.0", "GPL-2.0-only"],
+    "note": "Static file-notice and dependency-scope review completed; author selected MIT for first-party files. Existing third-party notices retained. Not an exhaustive legal audit."
+  },
+  "excluded_artifacts": ["build", "third_party", "models", "downloads", "artifacts"],
+  "third_party": [
+    {
+      "component": "linux",
+      "license_source": "linux/COPYING and linux/LICENSES",
+      "adaptations": "scripts/linux-support"
+    },
+    {
+      "component": "zephyr",
+      "source_lock": "sources.lock.yaml#zephyr",
+      "license_source": "upstream LICENSE and individual file notices",
+      "adaptations": "zephyr/patches"
+    },
+    {
+      "component": "rknn-llm",
+      "source_lock": "sources.lock.yaml#rknn_llm",
+      "license_source": "upstream LICENSE",
+      "adaptations": "agent/rkllm-server-r7.patch",
+      "prepared_notice": "LICENSE.upstream",
+      "runtime_in_main_repository": false
+    }
+  ]
+}
